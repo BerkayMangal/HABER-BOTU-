@@ -45,12 +45,39 @@ TELETHON_SESSION  = os.environ.get("TELETHON_SESSION", "")
 # AYARLAR
 # ─────────────────────────────────────────────
 POLL_INTERVAL  = 12    # saniye — her döngü
-AI_INTERVAL    = 40    # saniye — min AI çağrı aralığı
-MAX_GLOBAL     = 2     # döngü başına max global haber
-MAX_TURKEY     = 6     # döngü başına max türkiye haberi
-TURKEY_THRESH  = 8     # türkiye eşiği
-GLOBAL_THRESH  = 9     # global eşiği
+AI_INTERVAL    = 30    # saniye — min AI çağrı aralığı
+MAX_GLOBAL     = 3     # döngü başına max global haber
+MAX_TURKEY     = 10    # döngü başına max türkiye haberi
+TURKEY_THRESH  = 7     # türkiye eşiği (8'den 7'ye düşürdük)
+GLOBAL_THRESH  = 8     # global eşiği (9'dan 8'e düşürdük)
 NOVELTY_HOURS  = 24    # novelty hafıza penceresi
+
+# ─────────────────────────────────────────────
+# ACİL KEYWORD'LER — AI beklemeden anında gönder
+# ─────────────────────────────────────────────
+ACIL_KEYWORDS_TR = [
+    "faiz kararı", "faiz artırım", "faiz indirim", "tcmb kararı",
+    "merkez bankası kararı", "olağanüstü toplantı", "acil toplantı",
+    "deprem", "sel", "patlama", "yangın", "kaza",
+    "iflas", "konkordato", "haciz", "spk durdurdu", "spk inceleme",
+    "yaptırım", "ambargo", "savaş", "operasyon",
+    "dolar", "kur", "try", "tl krizi",
+    "bedelsiz", "temettü", "pay geri alım", "halka arz iptal",
+    "birleşme", "satın alma", "devralma", "m&a",
+    "genel kurul", "ceo değişikliği", "yönetim kurulu istifa",
+]
+
+ACIL_KEYWORDS_GLOBAL = [
+    "emergency rate", "emergency meeting", "fed emergency",
+    "war declared", "nuclear", "default", "bankruptcy",
+    "oil spike", "market crash", "black swan",
+    "sanctions turkey", "türkiye yaptırım",
+]
+
+def acil_mi(baslik: str, mod: str) -> bool:
+    b = baslik.lower()
+    keywords = ACIL_KEYWORDS_TR if mod == "turkey" else ACIL_KEYWORDS_GLOBAL
+    return any(kw in b for kw in keywords)
 
 # ─────────────────────────────────────────────
 # DİNLENECEK TELEGRAM KANALLARI
@@ -526,7 +553,9 @@ async def ana_dongu():
                 telegram_kuyruk.clear()
 
             # Haberleri işle ve kuyruğa ekle
-            def isle(haberler, kuyruk):
+            acil_kuyruk = []
+
+            def isle(haberler, kuyruk, mod):
                 for h in haberler:
                     hsh = hash_h(h["baslik"])
                     if hsh not in gonderilen and h["baslik"] and len(h["baslik"]) > 10:
@@ -535,10 +564,33 @@ async def ana_dongu():
                             h["semboller"] = nov.entity_bul(h["baslik"])
                         ek = h["semboller"][0] if h["semboller"] else "GENEL"
                         h["novelty"] = nov.skorla(ek, h["baslik"])
-                        kuyruk.append(h)
+                        if acil_mi(h["baslik"], mod):
+                            h["skor"] = 9
+                            h["ozet"] = "⚠️ Acil keyword — anında gönderildi"
+                            acil_kuyruk.append((h, mod))
+                        else:
+                            kuyruk.append(h)
 
-            isle(g_raw, bekl_global)
-            isle(t_raw, bekl_turkey)
+            isle(g_raw, bekl_global, "global")
+            isle(t_raw, bekl_turkey, "turkey")
+
+            # ACİL haberleri AI beklemeden hemen gönder
+            if acil_kuyruk:
+                log.info(f"🚨 {len(acil_kuyruk)} ACİL haber!")
+                for h, mod in acil_kuyruk:
+                    try:
+                        h["yon"] = "NÖTR"
+                        await bot.send_message(
+                            chat_id=CHAT_ID,
+                            text=mesaj_olustur(h, mod),
+                            parse_mode=ParseMode.HTML,
+                            disable_web_page_preview=True
+                        )
+                        toplam_gonderilen += 1
+                        log.info(f"🚨 ACİL: {h['baslik'][:70]}")
+                        await asyncio.sleep(1)
+                    except Exception as ex:
+                        log.error(f"Acil gönderme: {ex}")
 
             toplam = len(bekl_global) + len(bekl_turkey)
             if toplam > 0:
@@ -613,3 +665,4 @@ async def ana_dongu():
         await asyncio.sleep(POLL_INTERVAL)
 
 asyncio.run(ana_dongu())
+
