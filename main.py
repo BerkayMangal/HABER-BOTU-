@@ -959,7 +959,7 @@ class MacroEngine:
                 await self._send_pre(bot, ev_time, event_name, country, impact,
                                      forecast, previous)
 
-        elif diff_min < 5 and actual is not None and str(actual).strip() not in ("", "0"):
+        elif diff_min < 30 and actual is not None and str(actual).strip() not in ("", "0"):
             key = f"release_{ev_key}"
             if key not in self.sent_release:
                 self.sent_release.add(key)
