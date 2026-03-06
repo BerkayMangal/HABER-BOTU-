@@ -1,24 +1,37 @@
-╔══════════════════════════════════════════════════════╗
-║        BERKAY TERMINATOR v3.1 — RAILWAY              ║
-║  Macro Engine · Event Dedup · Source Tiering         ║
-║  Feedback Buttons · Multi-Horizon ML · 3-Stream      ║
-╚══════════════════════════════════════════════════════╝
+# ================================================================
+# BERKAY TERMINATOR v3.1 — RAILWAY
+# Macro Engine · Event Dedup · Source Tiering
+# Feedback Buttons · Multi-Horizon ML · 3-Stream
+# Brent Radar · Saatlik Teknik Seviyeler
+# ================================================================
+#
+# v3.1 YENILIKLER:
+#   Kalici dedup  — restart'ta hash'ler SQLite'tan yuklenir
+#   Timestamp fix — isoformat, tum DB sorgular dogru calisir
+#   Source tiering — TCMB/KAP/Reuters ayri puanlanir
+#   Event ID      — ayni olaydan 20dk icinde gelen haberler tek event
+#   Macro Engine  — Finnhub calendar + 30dk once + veri ani + 5dk tepki
+#   Surprise score — (actual-forecast)/abs(forecast)
+#   Feedback butonlari — her mesaja, SQLite'a kayit
+#   3 stream      — MACRO / COMPANY / GEO mesaj formatinda ayrim
+#   Multi-horizon ML — 5m/15m/60m/close + relative_move
+#   TR full takvim — TCMB/TUFE/cari/buyume + ABD core
+#   Brent Radar   — %0.5 sari alarm, %1.0 kirmizi alarm, her iki yon
+#   Brent Teknik  — Her 30 dk pivot/MA/destek/direnc seviyeleri
+#   Petrol haberleri — oncelikli skorlama (+2 puan)
+# ================================================================
 
-v3.1 YENİLİKLER:
-  ✅ Kalıcı dedup — restart'ta hash'ler SQLite'tan yüklenir
-  ✅ Timestamp fix — isoformat, tüm DB sorgular doğru çalışır
-  ✅ Source tiering — TCMB/KAP/Reuters ayrı puanlanır
-  ✅ Event ID — aynı olaydan 20dk içinde gelen haberler tek event
-  ✅ Macro Engine — Finnhub calendar + 30dk önce + veri anı + 5dk tepki
-  ✅ Surprise score — (actual-forecast)/abs(forecast)
-  ✅ Feedback butonları — ✅❌⏰ her mesaja, SQLite'a kayıt
-  ✅ 3 stream — MACRO / COMPANY / GEO mesaj formatında ayrım
-  ✅ Multi-horizon ML — 5m/15m/60m/close + relative_move
-  ✅ TR full takvim — TCMB/TÜFE/cari/büyüme + ABD core
-"""
-
-import asyncio, feedparser, requests, hashlib, json, logging
-import time, re, os, random, sqlite3
+import asyncio
+import feedparser
+import requests
+import hashlib
+import json
+import logging
+import time
+import re
+import os
+import random
+import sqlite3
 from datetime import datetime, timedelta
 from collections import defaultdict
 from bs4 import BeautifulSoup
@@ -42,9 +55,9 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ════════════════════════════════════════════════
-# 🔑 KEY'LER
-# ════════════════════════════════════════════════
+# ================================================================
+# KEYLER
+# ================================================================
 TELEGRAM_TOKEN    = os.environ["TELEGRAM_TOKEN"]
 CHAT_ID           = os.environ["CHAT_ID"]
 ANTHROPIC_KEY     = os.environ["ANTHROPIC_KEY"]
@@ -54,25 +67,26 @@ TELEGRAM_API_ID   = int(os.environ["TELEGRAM_API_ID"])
 TELEGRAM_API_HASH = os.environ["TELEGRAM_API_HASH"]
 TELETHON_SESSION  = os.environ.get("TELETHON_SESSION", "")
 
-# ════════════════════════════════════════════════
-# ⚙️ AYARLAR
-# ════════════════════════════════════════════════
-POLL_INTERVAL    = 12
-AI_INTERVAL      = 35
-MAX_GLOBAL       = 3
-MAX_TURKEY       = 8
-TURKEY_THRESH    = 7
-GLOBAL_THRESH    = 8
-NOVELTY_HOURS    = 24
-PRICE_INTERVAL   = 300
-MACRO_INTERVAL   = 60
-FEEDBACK_INTERVAL= 60
+# ================================================================
+# AYARLAR
+# ================================================================
+POLL_INTERVAL     = 12
+AI_INTERVAL       = 35
+MAX_GLOBAL        = 3
+MAX_TURKEY        = 8
+TURKEY_THRESH     = 7
+GLOBAL_THRESH     = 8
+NOVELTY_HOURS     = 24
+PRICE_INTERVAL    = 120   # Brent fiyat kontrolu her 2 dk
+MACRO_INTERVAL    = 60
+FEEDBACK_INTERVAL = 60
+BRENT_TEKNIK_INTERVAL = 1800  # 30 dk
 
 TELEGRAM_KANALLARI = []
 
-# ════════════════════════════════════════════════
-# 📊 BIST30 + ENTİTY
-# ════════════════════════════════════════════════
+# ================================================================
+# BIST30 + ENTITY
+# ================================================================
 BIST30 = [
     "THYAO","GARAN","AKBNK","ISCTR","YKBNK","TUPRS","EREGL","ASELS",
     "KCHOL","SAHOL","SISE","TOASO","FROTO","PGSUS","KOZAL","EKGYO",
@@ -81,121 +95,159 @@ BIST30 = [
 ]
 
 ENTITY_DICT = {
-    "THYAO": ["türk hava yolları","thy","turkish airlines"],
+    "THYAO": ["turk hava yollari","thy","turkish airlines"],
     "GARAN": ["garanti","garanti bbva"],
     "AKBNK": ["akbank"],
-    "ISCTR": ["iş bankası","işbank","isbank"],
-    "YKBNK": ["yapı kredi","yapi kredi"],
-    "TUPRS": ["tüpraş","tupras"],
-    "EREGL": ["ereğli","erdemir","eregli","isdemir"],
+    "ISCTR": ["is bankasi","isbank"],
+    "YKBNK": ["yapi kredi"],
+    "TUPRS": ["tupras","tupras"],
+    "EREGL": ["eregli","erdemir","isdemir"],
     "ASELS": ["aselsan"],
-    "KCHOL": ["koç holding","koç grubu"],
-    "SAHOL": ["sabancı holding","sabancı"],
-    "SISE":  ["şişecam","sisecam"],
-    "TOASO": ["tofaş","tofas"],
+    "KCHOL": ["koc holding","koc grubu"],
+    "SAHOL": ["sabanci holding","sabanci"],
+    "SISE":  ["sisecam"],
+    "TOASO": ["tofas"],
     "FROTO": ["ford otosan"],
     "PGSUS": ["pegasus"],
     "TCELL": ["turkcell"],
-    "TTKOM": ["türk telekom","turk telekom","ttnet"],
-    "BIMAS": ["bim","bim mağazaları"],
+    "TTKOM": ["turk telekom","ttnet"],
+    "BIMAS": ["bim","bim magazalari"],
     "MGROS": ["migros"],
-    "ARCLK": ["arçelik","arcelik","beko"],
+    "ARCLK": ["arcelik","beko"],
     "PETKM": ["petkim"],
-    "ENKAI": ["enka inşaat","enka"],
-    "TAVHL": ["tav havalimanları","tav airports"],
-    "KOZAL": ["koza altın","koza anadolu"],
+    "ENKAI": ["enka insaat","enka"],
+    "TAVHL": ["tav havalimanlari","tav airports"],
+    "KOZAL": ["koza altin","koza anadolu"],
     "EKGYO": ["emlak konut","emlak gyo"],
-    "ULKER": ["ülker","ulker"],
+    "ULKER": ["ulker"],
     "VESTL": ["vestel"],
-    "DOHOL": ["doğuş holding"],
+    "DOHOL": ["dogus holding"],
     "AYGAZ": ["aygaz"],
-    "LOGO":  ["logo yazılım"],
-    "SOKM":  ["şok market","şok mağazaları"],
+    "LOGO":  ["logo yazilim"],
+    "SOKM":  ["sok market"],
 }
 
-# ════════════════════════════════════════════════
-# 🏆 SOURCE TIERING
-# ════════════════════════════════════════════════
+# ================================================================
+# SOURCE TIERING
+# ================================================================
 TIER1_SOURCES = [
     "tcmb","spk","bddk","hazine","resmi gazete","borsa istanbul",
     "kap","btk","epdk","ssb","rekabet kurumu","borsaistanbul"
 ]
 TIER2_SOURCES = [
     "reuters","bloomberg","ap news","fed","ecb","iaea","nato",
-    "abd dışişleri","aa ekonomi","aa gündem","dha","bia","isw",
+    "abd disisleri","aa ekonomi","aa gundem","dha","isw",
     "al monitor","finnhub","marketaux","usgs"
 ]
 
-def kaynak_tier(kaynak: str) -> int:
+def kaynak_tier(kaynak):
     k = kaynak.lower()
     if any(s in k for s in TIER1_SOURCES): return 1
     if any(s in k for s in TIER2_SOURCES): return 2
     return 3
 
-def tier_skor_ayarla(skor: int, tier: int) -> int:
+def tier_skor_ayarla(skor, tier):
     if tier == 1: return min(10, skor + 1)
     if tier == 3: return max(0, skor - 1)
     return skor
 
-# ════════════════════════════════════════════════
-# 🎯 SEKTÖR MATRİSİ
-# ════════════════════════════════════════════════
-SEKTOR_MATRISI = [
-    (["petrol fiyat arttı","brent yükseldi","opec kesinti","hürmüz riski","iran petrol ambargo"],
-     ["TUPRS","PETKM","AYGAZ"], "BEARISH", "Petrol maliyeti artar → marj baskısı"),
-    (["petrol düştü","brent geriledi","opec üretim arttı"],
-     ["TUPRS","PETKM","AYGAZ"], "BULLISH", "Petrol düşer → marj genişler"),
-    (["savunma ihalesi","ssb sözleşme","siha","insansız hava","füze sözleşme"],
-     ["ASELS"], "BULLISH", "Savunma siparişi → gelir artışı"),
-    (["savaş ilan","kara harekâtı","bombardıman başladı","çatışma tırmandı"],
-     ["ASELS","KOZAL"], "MIXED", "Jeopolitik risk → güvenli liman"),
-    (["altın yükseldi","altın rekor","gold rally","xau yükseldi"],
-     ["KOZAL"], "BULLISH", "Altın fiyatı → gelir artar"),
-    (["altın düştü","gold drops","altın geriledi"],
-     ["KOZAL"], "BEARISH", "Altın düşer → gelir azalır"),
-    (["çelik fiyat arttı","demir fiyat arttı","hrc arttı","steel up"],
-     ["EREGL"], "BULLISH", "Çelik fiyatı artar → karlılık artar"),
-    (["çelik düştü","steel drops","demir düştü"],
-     ["EREGL"], "BEARISH", "Çelik düşer → karlılık azalır"),
-    (["faiz artırdı","faiz artış sürprizi","tcmb sıkılaştı","baz puan artış"],
-     ["GARAN","AKBNK","ISCTR","YKBNK"], "BEARISH", "Faiz artışı → banka marjı sıkışır"),
-    (["faiz indirdi","tcmb gevşedi","baz puan indirim","faiz indirim"],
-     ["GARAN","AKBNK","ISCTR","YKBNK"], "BULLISH", "Faiz indirimi → banka karlılığı artar"),
-    (["dolar sert yükseldi","kur tırmandı","tl değer kaybetti","tl çöktü"],
-     ["THYAO","FROTO","EREGL","TUPRS"], "BULLISH", "TL zayıflar → ihracatçı kazanır"),
-    (["dolar sert yükseldi","kur tırmandı","tl değer kaybetti"],
-     ["BIMAS","MGROS","ARCLK"], "BEARISH", "TL zayıflar → ithalatçı maliyet artar"),
-    (["turizm rekoru","turist sayısı arttı","yolcu rekoru"],
-     ["THYAO","PGSUS","TAVHL"], "BULLISH", "Turizm güçlü → yolcu geliri artar"),
-    (["büyük deprem","şiddetli deprem","yıkıcı deprem"],
-     ["EKGYO","ENKAI"], "BEARISH", "Deprem → inşaat/GYO riski"),
-    (["ihracat rekoru","dış ticaret fazlası","ihracat güçlü"],
-     ["FROTO","TOASO","EREGL","ARCLK"], "BULLISH", "İhracat güçlü → döviz geliri artar"),
+# ================================================================
+# PETROL ONCELIKLI HABERLER
+# ================================================================
+PETROL_KEYWORDS = [
+    # OPEC
+    "opec toplantisi","opec karari","opec uretim","opec+ kesinti","opec acil",
+    "opec meeting","opec cuts","opec output","opec decision",
+    # Hormuz / savaş
+    "hurmuz bogazi","strait of hormuz","hormuz closed","hormuz tensions",
+    "hurmuz kapandi","tanker saldiri","tanker attack",
+    # Iran
+    "iran petrol","iran oil","iran sanctions","iran yaptirimi",
+    "iran nükleer","iran nuclear deal","iran embargo",
+    # Rusya enerji
+    "rusya petrol","russia oil","russia energy","russian oil",
+    "petrol tavan fiyat","oil price cap",
+    # Yemen/Husiler
+    "husiler","houthi","kizildeniz","red sea tanker","red sea attack",
+    # Suudi Arabistan
+    "suudi arabistan","saudi arabia","aramco","saudi output",
+    # Libya/Irak/Nijerya
+    "libya petrol","iraq oil","nigeria oil","libyan output",
+    # ABD stok
+    "eia petrol stok","eia crude","crude inventory","oil inventory",
+    "spr release","strategic petroleum reserve",
+    # Genel fiyat
+    "brent +","wti +","ham petrol","crude oil rally","oil spike",
+    "petrol firlamasi","petrol coktu","petrol sert",
+    # Talep
+    "china oil demand","cin petrol talebi","global oil demand",
 ]
 
-def sektor_analiz(baslik: str):
+def petrol_haberi_mi(baslik):
     b = baslik.lower()
-    hisseler, yon, ozet = [], "NÖTR", ""
+    return any(kw in b for kw in PETROL_KEYWORDS)
+
+# ================================================================
+# SEKTOR MATRISI
+# ================================================================
+SEKTOR_MATRISI = [
+    (["petrol fiyat artti","brent yukseldi","opec kesinti","hurmuz riski","iran petrol ambargo"],
+     ["TUPRS","PETKM","AYGAZ"], "BEARISH", "Petrol maliyeti artar"),
+    (["petrol dustu","brent geriledi","opec uretim artti"],
+     ["TUPRS","PETKM","AYGAZ"], "BULLISH", "Petrol dusuyor, maliyet rahatlar"),
+    (["savunma ihalesi","ssb sozlesme","siha","insansiz hava","fuze sozlesme"],
+     ["ASELS"], "BULLISH", "Savunma siparisi"),
+    (["savaş ilan","kara harekat","bombardiman basladi","catisma tirmandi"],
+     ["ASELS","KOZAL"], "MIXED", "Jeopolitik risk"),
+    (["altin yukseldi","altin rekor","gold rally","xau yukseldi"],
+     ["KOZAL"], "BULLISH", "Altin yukseliyor"),
+    (["altin dustu","gold drops","altin geriledi"],
+     ["KOZAL"], "BEARISH", "Altin dusuyor"),
+    (["celik fiyat artti","demir fiyat artti","hrc artti","steel up"],
+     ["EREGL"], "BULLISH", "Celik fiyati artiyor"),
+    (["celik dustu","steel drops","demir dustu"],
+     ["EREGL"], "BEARISH", "Celik fiyati dusuyor"),
+    (["faiz artirdi","faiz artis surprizi","tcmb sikilasti","baz puan artis"],
+     ["GARAN","AKBNK","ISCTR","YKBNK"], "BEARISH", "Faiz artisi, banka marji sikisiyor"),
+    (["faiz indirdi","tcmb gevşedi","baz puan indirim","faiz indirim"],
+     ["GARAN","AKBNK","ISCTR","YKBNK"], "BULLISH", "Faiz indirimi, banka karliligi artar"),
+    (["dolar sert yukseldi","kur tirmandi","tl deger kaybetti","tl cokustu"],
+     ["THYAO","FROTO","EREGL","TUPRS"], "BULLISH", "TL zayfliyor, ihracatci kazaniyor"),
+    (["dolar sert yukseldi","kur tirmandi","tl deger kaybetti"],
+     ["BIMAS","MGROS","ARCLK"], "BEARISH", "TL zayfliyor, ithalatci maliyet artiyor"),
+    (["turizm rekoru","turist sayisi artti","yolcu rekoru"],
+     ["THYAO","PGSUS","TAVHL"], "BULLISH", "Turizm guclu"),
+    (["buyuk deprem","siddetli deprem","yikici deprem"],
+     ["EKGYO","ENKAI"], "BEARISH", "Deprem riski"),
+    (["ihracat rekoru","ihracat guclu"],
+     ["FROTO","TOASO","EREGL","ARCLK"], "BULLISH", "Ihracat guclu"),
+]
+
+def sektor_analiz(baslik):
+    b = baslik.lower()
+    hisseler, yon, ozet = [], "NOTR", ""
     for keywords, syms, _yon, _oz in SEKTOR_MATRISI:
         if any(kw in b for kw in keywords):
             for s in syms:
-                if s not in hisseler: hisseler.append(s)
-            if not ozet: yon, ozet = _yon, _oz
+                if s not in hisseler:
+                    hisseler.append(s)
+            if not ozet:
+                yon, ozet = _yon, _oz
     return hisseler[:5], yon, ozet
 
-# ════════════════════════════════════════════════
-# 🚨 ACİL KEYWORD'LER (Spesifik)
-# ════════════════════════════════════════════════
+# ================================================================
+# ACIL KEYWORDLER
+# ================================================================
 ACIL_TR = [
-    "tcmb acil toplantı","merkez bankası acil","olağanüstü para kurulu",
-    "faiz kararı açıklandı","faiz kararı bugün",
-    "büyük deprem","şiddetli deprem","depremin büyüklüğü 6","depremin büyüklüğü 7",
-    "iflas başvurusu","konkordato ilan","spk işlem durdurdu",
-    "türkiye'ye yaptırım","yaptırım paketi türkiye",
-    "sıkıyönetim ilan","olağanüstü hal ilan","sokağa çıkma yasağı",
-    "tl kriz","kur 40","kur 45","lira çöktü",
-    "bedelsiz sermaye artırımı","temettü dağıtım tarihi","pay geri alım programı",
-    "satın alma anlaşması imzalandı","devralma tamamlandı","birleşme onayı",
+    "tcmb acil toplanti","merkez bankasi acil","olaganustu para kurulu",
+    "faiz karari aciklandi","faiz karari bugun",
+    "buyuk deprem","siddetli deprem","depremin buyuklugu 6","depremin buyuklugu 7",
+    "iflas basvurusu","konkordato ilan","spk islem durdurdu",
+    "turkiye'ye yaptirim","yaptirim paketi turkiye",
+    "sikiyonetim ilan","olaganustu hal ilan","sokaga cikma yasagi",
+    "tl kriz","kur 40","kur 45","lira cokustu",
+    "bedelsiz sermaye artirimi","temettu dagitim tarihi","pay geri alim programi",
+    "satin alma anlasmasi imzalandi","devralma tamamlandi","bilesme onayi",
 ]
 ACIL_GLOBAL = [
     "fed emergency meeting","emergency rate cut",
@@ -206,47 +258,48 @@ ACIL_GLOBAL = [
     "sovereign default","imf emergency bailout",
 ]
 
-def acil_mi(baslik: str, mod: str) -> bool:
+def acil_mi(baslik, mod):
     b = baslik.lower()
     return any(kw in b for kw in (ACIL_TR if mod == "turkey" else ACIL_GLOBAL))
 
-# ════════════════════════════════════════════════
-# 📡 EVENT ID — Aynı olaydan spam engeli
-# ════════════════════════════════════════════════
+# ================================================================
+# EVENT ID — Ayni olaydan spam engeli
+# ================================================================
 EVENT_CLUSTERS = {
-    "mideast":     ["israel","iran","tel aviv","tehran","idf","hamas","hizbullah","gaza"],
-    "ukraine":     ["ukrayna","rusya","ukraine","russia","putin","zelensky","kyiv"],
-    "fed_rate":    ["fomc","powell","federal reserve rate decision","fed rate"],
-    "tcmb_rate":   ["tcmb faiz","ppk kararı","para politikası toplantı"],
-    "oil_shock":   ["brent +","petrol fiyat arttı","opec acil","hürmüz kapandı"],
-    "tl_crisis":   ["tl kriz","dolar tavan","kur +","lira çöküş"],
-    "earthquake":  ["büyük deprem","şiddetli deprem","earthquake m","sismik"],
-    "china":       ["çin ekonomi","china gdp","pboc","yuan devaluation"],
+    "mideast":    ["israel","iran","tel aviv","tehran","idf","hamas","hizbullah","gaza"],
+    "ukraine":    ["ukrayna","rusya","ukraine","russia","putin","zelensky","kyiv"],
+    "fed_rate":   ["fomc","powell","federal reserve rate decision","fed rate"],
+    "tcmb_rate":  ["tcmb faiz","ppk karari","para politikasi toplanti"],
+    "oil_shock":  ["brent +","petrol fiyat artti","opec acil","hurmuz kapandi"],
+    "tl_crisis":  ["tl kriz","dolar tavan","kur +","lira cokus"],
+    "earthquake": ["buyuk deprem","siddetli deprem","earthquake m","sismik"],
+    "china":      ["cin ekonomi","china gdp","pboc","yuan devaluation"],
 }
 
-event_log: dict[str, list] = defaultdict(list)  # event_id -> [(baslik, dt)]
+event_log = defaultdict(list)
 EVENT_WINDOW_MIN = 20
 
-def event_id_bul(baslik: str) -> str | None:
+def event_id_bul(baslik):
     b = baslik.lower()
     for eid, keywords in EVENT_CLUSTERS.items():
         if any(kw in b for kw in keywords):
             return eid
     return None
 
-def event_tekrar_mi(baslik: str) -> bool:
+def event_tekrar_mi(baslik):
     eid = event_id_bul(baslik)
-    if not eid: return False
+    if not eid:
+        return False
     sinir = datetime.now() - timedelta(minutes=EVENT_WINDOW_MIN)
     event_log[eid] = [(b, t) for b, t in event_log[eid] if t > sinir]
     duplicate = len(event_log[eid]) >= 2
     event_log[eid].append((baslik, datetime.now()))
     return duplicate
 
-# ════════════════════════════════════════════════
-# 🗂️ STREAM BELIRLEME
-# ════════════════════════════════════════════════
-def stream_belirle(h: dict) -> str:
+# ================================================================
+# STREAM BELIRLEME
+# ================================================================
+def stream_belirle(h):
     b   = h["baslik"].lower()
     k   = h["kaynak"].lower()
     tip = h.get("kaynak_tip", "")
@@ -254,15 +307,20 @@ def stream_belirle(h: dict) -> str:
 
     if t == 1 and any(s in k for s in ["tcmb","spk","bddk","hazine","resmi"]):
         return "MACRO"
-    if tip == "sirket" or any(kw in b for kw in ["kap ","temettü","bedelsiz","geri alım","kontrat","sözleşme imza","bilanço"]):
+    if (tip == "sirket" or
+        any(kw in b for kw in ["temettü","bedelsiz","geri alim","kontrat",
+                                "sozlesme imza","bilanco","kap "])):
         return "COMPANY"
-    if any(kw in b for kw in ["petrol","brent","altın","gold","savaş","war","füze","deprem","earthquake","jeopolitik","opec","hürmüz"]):
+    if petrol_haberi_mi(b):
+        return "PETROL"
+    if any(kw in b for kw in ["petrol","brent","altin","gold","savas","war",
+                               "fuze","deprem","earthquake","jeopolitik","opec","hurmuz"]):
         return "GEO"
     return "NEWS"
 
-# ════════════════════════════════════════════════
-# 🗄️ SQLite — Tam schema
-# ════════════════════════════════════════════════
+# ================================================================
+# SQLITE — Tam schema
+# ================================================================
 DB_PATH = "/app/terminator.db"
 
 def db_init():
@@ -279,7 +337,7 @@ def db_init():
         url             TEXT,
         ai_skor         INTEGER DEFAULT 0,
         ml_skor         REAL DEFAULT 0.5,
-        yon             TEXT DEFAULT 'NÖTR',
+        yon             TEXT DEFAULT 'NOTR',
         semboller       TEXT DEFAULT '[]',
         novelty         REAL DEFAULT 1.0,
         mod             TEXT,
@@ -310,22 +368,20 @@ def db_init():
         actual      REAL,
         surprise    REAL,
         phase       TEXT,
-        symbols     TEXT,
-        rx_usdtry   REAL,
-        rx_xu030    REAL
+        symbols     TEXT
     );
-    CREATE TABLE IF NOT EXISTS fiyat_log (
+    CREATE TABLE IF NOT EXISTS brent_log (
         id          INTEGER PRIMARY KEY AUTOINCREMENT,
         timestamp   TEXT,
-        sembol      TEXT,
-        fiyat       REAL
+        price       REAL,
+        change_pct  REAL
     );
     """)
     con.commit()
     con.close()
 
-# Kalıcı dedup — startup'ta yükle
-gonderilen: set[str] = set()
+# Kalici dedup
+gonderilen = set()
 
 def dedup_yukle():
     global gonderilen
@@ -337,11 +393,11 @@ def dedup_yukle():
         ).fetchall()
         con.close()
         gonderilen = {r[0] for r in rows}
-        log.info(f"📂 Dedup: {len(gonderilen)} hash yüklendi")
+        log.info(f"Dedup: {len(gonderilen)} hash yuklendi")
     except Exception as e:
         log.warning(f"dedup_yukle: {e}")
 
-def dedup_kaydet(h: str):
+def dedup_kaydet(h):
     try:
         con = sqlite3.connect(DB_PATH)
         con.execute(
@@ -350,10 +406,10 @@ def dedup_kaydet(h: str):
         )
         con.commit()
         con.close()
-    except: pass
+    except:
+        pass
 
-def db_kaydet(h: dict, mod: str, gonderildi: int = 0) -> int:
-    """Haberi DB'ye kaydet, ID döndür (feedback için gerekli)"""
+def db_kaydet(h, mod, gonderildi_flag=0):
     try:
         con = sqlite3.connect(DB_PATH)
         cur = con.execute("""
@@ -363,20 +419,20 @@ def db_kaydet(h: dict, mod: str, gonderildi: int = 0) -> int:
              scheduled_event,surprise)
             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
-            event_id_bul(h.get("baslik","")),
+            event_id_bul(h.get("baslik", "")),
             datetime.now().isoformat(),
-            h.get("stream","NEWS"),
-            h.get("kaynak",""),
+            h.get("stream", "NEWS"),
+            h.get("kaynak", ""),
             h.get("tier", 2),
-            h.get("baslik",""),
-            h.get("url",""),
+            h.get("baslik", ""),
+            h.get("url", ""),
             h.get("skor", 0),
             h.get("ml_skor", 0.5),
-            h.get("yon","NÖTR"),
-            json.dumps(h.get("semboller",[])),
+            h.get("yon", "NOTR"),
+            json.dumps(h.get("semboller", [])),
             h.get("novelty", 1.0),
             mod,
-            gonderildi,
+            gonderildi_flag,
             1 if h.get("scheduled_event") else 0,
             h.get("surprise"),
         ))
@@ -388,27 +444,30 @@ def db_kaydet(h: dict, mod: str, gonderildi: int = 0) -> int:
         log.debug(f"db_kaydet: {e}")
         return 0
 
-def db_msg_id_guncelle(haber_id: int, msg_id: int):
+def db_msg_id_guncelle(haber_id, msg_id):
     try:
         con = sqlite3.connect(DB_PATH)
-        con.execute("UPDATE haberler SET telegram_msg_id=? WHERE id=?", (msg_id, haber_id))
+        con.execute(
+            "UPDATE haberler SET telegram_msg_id=? WHERE id=?", (msg_id, haber_id)
+        )
         con.commit()
         con.close()
-    except: pass
+    except:
+        pass
 
-# ════════════════════════════════════════════════
-# 💬 FEEDBACK BUTONU
-# ════════════════════════════════════════════════
-def feedback_keyboard(haber_id: int) -> InlineKeyboardMarkup:
+# ================================================================
+# FEEDBACK BUTONU
+# ================================================================
+def feedback_keyboard(haber_id):
     return InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ İşe yaradı", callback_data=f"fb_good_{haber_id}"),
-        InlineKeyboardButton("❌ Gürültü",    callback_data=f"fb_noise_{haber_id}"),
-        InlineKeyboardButton("⏰ Geç kaldı",  callback_data=f"fb_late_{haber_id}"),
+        InlineKeyboardButton("Iyi",      callback_data=f"fb_good_{haber_id}"),
+        InlineKeyboardButton("Gurultu",  callback_data=f"fb_noise_{haber_id}"),
+        InlineKeyboardButton("Gec kaldi",callback_data=f"fb_late_{haber_id}"),
     ]])
 
 update_offset = 0
 
-async def feedback_kontrol(bot: Bot):
+async def feedback_kontrol(bot):
     global update_offset
     try:
         updates = await bot.get_updates(
@@ -418,24 +477,253 @@ async def feedback_kontrol(bot: Bot):
         for upd in updates:
             update_offset = upd.update_id + 1
             cq = upd.callback_query
-            if not cq: continue
-            await bot.answer_callback_query(callback_query_id=cq.id, text="✅ Kaydedildi")
+            if not cq:
+                continue
+            await bot.answer_callback_query(callback_query_id=cq.id, text="Kaydedildi")
             parts = cq.data.split("_")
             if len(parts) == 3 and parts[0] == "fb":
-                fb_type  = parts[1]  # good/noise/late
+                fb_type  = parts[1]
                 haber_id = int(parts[2])
                 con = sqlite3.connect(DB_PATH)
-                con.execute("UPDATE haberler SET feedback=? WHERE id=?", (fb_type, haber_id))
+                con.execute(
+                    "UPDATE haberler SET feedback=? WHERE id=?", (fb_type, haber_id)
+                )
                 con.commit()
                 con.close()
-                fb_emoji = {"good":"✅","noise":"❌","late":"⏰"}.get(fb_type,"?")
-                log.info(f"Feedback {fb_emoji} → haber #{haber_id}")
+                log.info(f"Feedback {fb_type} -> haber #{haber_id}")
     except Exception as e:
         log.debug(f"feedback_kontrol: {e}")
 
-# ════════════════════════════════════════════════
-# 🤖 ML MODELİ — Multi-horizon labels
-# ════════════════════════════════════════════════
+# ================================================================
+# BRENT RADAR — %0.5 sari, %1.0 kirmizi, her iki yon
+# ================================================================
+class BrentRadar:
+    def __init__(self):
+        self.onceki_fiyat   = None
+        self.baz_fiyat      = None   # alarm bazi (son alarmdan sonra reset)
+        self.son_teknik     = 0.0
+        self.ESIK_SARI      = 0.5
+        self.ESIK_KIRMIZI   = 1.0
+        self.TEKNIK_INTERVAL= BRENT_TEKNIK_INTERVAL
+
+    def _brent_fiyat_cek(self):
+        """Yahoo Finance'ten BZ=F (ICE Brent Futures)"""
+        try:
+            url = "https://query1.finance.yahoo.com/v8/finance/chart/BZ=F"
+            r   = requests.get(
+                url,
+                params={"interval": "1m", "range": "1d"},
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=8
+            )
+            data   = r.json()
+            meta   = data["chart"]["result"][0]["meta"]
+            fiyat  = meta.get("regularMarketPrice") or meta.get("previousClose")
+            return round(float(fiyat), 2) if fiyat else None
+        except:
+            return None
+
+    def _brent_gecmis_cek(self):
+        """20 gunluk gunluk data — pivot hesabi icin"""
+        try:
+            url = "https://query1.finance.yahoo.com/v8/finance/chart/BZ=F"
+            r   = requests.get(
+                url,
+                params={"interval": "1d", "range": "1mo"},
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=10
+            )
+            data    = r.json()
+            result  = data["chart"]["result"][0]
+            quotes  = result["indicators"]["quote"][0]
+            highs   = [x for x in quotes.get("high", []) if x]
+            lows    = [x for x in quotes.get("low", []) if x]
+            closes  = [x for x in quotes.get("close", []) if x]
+            opens   = [x for x in quotes.get("open", []) if x]
+            return highs, lows, closes, opens
+        except:
+            return None, None, None, None
+
+    def _pivot_hesapla(self, h, l, c):
+        """Classic Pivot Point hesabi"""
+        p  = (h + l + c) / 3
+        r1 = (2 * p) - l
+        r2 = p + (h - l)
+        r3 = h + 2 * (p - l)
+        s1 = (2 * p) - h
+        s2 = p - (h - l)
+        s3 = l - 2 * (h - p)
+        return {
+            "P": round(p, 2),
+            "R1": round(r1, 2), "R2": round(r2, 2), "R3": round(r3, 2),
+            "S1": round(s1, 2), "S2": round(s2, 2), "S3": round(s3, 2),
+        }
+
+    def _yorum_olustur(self, fiyat, pivot):
+        """Kural bazli teknik yorum"""
+        p  = pivot["P"]
+        r1 = pivot["R1"]
+        r2 = pivot["R2"]
+        s1 = pivot["S1"]
+        s2 = pivot["S2"]
+
+        if fiyat > r2:
+            return "Fiyat R2 ustunde — guclu yukselis momentumu, dikkatli izle"
+        elif fiyat > r1:
+            return "Fiyat R1-R2 arasinda — yukselis devam ediyor, R2 direnç"
+        elif fiyat > p:
+            return "Fiyat pivot ustunde — pozitif taraf, R1 hedef"
+        elif fiyat > s1:
+            return "Fiyat pivot altina indi — dikkat, S1 destek test ediliyor"
+        elif fiyat > s2:
+            return "Fiyat S1-S2 arasinda — zayif seyir, S2 kritik destek"
+        else:
+            return "Fiyat S2 altinda — guclu asagi baski, trend takip et"
+
+    async def fiyat_kontrol(self, bot):
+        """Her 2 dk Brent fiyatini kontrol et, alarm uret"""
+        fiyat = self._brent_fiyat_cek()
+        if not fiyat:
+            return
+
+        # DB'ye kaydet
+        try:
+            con = sqlite3.connect(DB_PATH)
+            con.execute(
+                "INSERT INTO brent_log (timestamp,price) VALUES (?,?)",
+                (datetime.now().isoformat(), fiyat)
+            )
+            con.commit()
+            con.close()
+        except:
+            pass
+
+        if self.baz_fiyat is None:
+            self.baz_fiyat  = fiyat
+            self.onceki_fiyat = fiyat
+            return
+
+        degisim = (fiyat - self.baz_fiyat) / self.baz_fiyat * 100
+        abs_deg = abs(degisim)
+
+        if abs_deg >= self.ESIK_KIRMIZI:
+            # Kirmizi alarm
+            yon_icon = "📈" if degisim > 0 else "📉"
+            yon_text = "YUKSELIS" if degisim > 0 else "DUSUS"
+            msg = (
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"🔴 <b>BRENT ALARM — {yon_text}</b> {yon_icon}\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"<b>{self.baz_fiyat:.2f}  →  {fiyat:.2f}</b>\n"
+                f"Hareket: <b>{yon_icon} %{abs_deg:.2f}</b>\n\n"
+                f"TUPRS  ·  PETKM  ·  AYGAZ\n\n"
+                f"⏰ {datetime.now().strftime('%H:%M:%S')}"
+            )
+            try:
+                await bot.send_message(
+                    chat_id=CHAT_ID, text=msg, parse_mode=ParseMode.HTML
+                )
+                log.info(f"BRENT KIRMIZI ALARM: {self.baz_fiyat} -> {fiyat} (%{abs_deg:.2f})")
+            except Exception as e:
+                log.error(f"Brent alarm: {e}")
+            self.baz_fiyat = fiyat  # baz sifirla
+
+        elif abs_deg >= self.ESIK_SARI:
+            # Sari alarm
+            yon_icon = "📈" if degisim > 0 else "📉"
+            msg = (
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"🟡 <b>BRENT HAREKET</b> {yon_icon}\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"{self.baz_fiyat:.2f}  →  <b>{fiyat:.2f}</b>\n"
+                f"Hareket: {yon_icon} <b>%{abs_deg:.2f}</b>\n\n"
+                f"⏰ {datetime.now().strftime('%H:%M:%S')}"
+            )
+            try:
+                await bot.send_message(
+                    chat_id=CHAT_ID, text=msg, parse_mode=ParseMode.HTML
+                )
+                log.info(f"Brent sari alarm: %{abs_deg:.2f}")
+            except Exception as e:
+                log.error(f"Brent sari: {e}")
+            self.baz_fiyat = fiyat
+
+        self.onceki_fiyat = fiyat
+
+    async def teknik_gonder(self, bot):
+        """Her 30 dk pivot + MA + teknik seviye mesaji"""
+        try:
+            fiyat = self._brent_fiyat_cek()
+            if not fiyat:
+                return
+
+            highs, lows, closes, opens = self._brent_gecmis_cek()
+            if not closes or len(closes) < 5:
+                return
+
+            # Dunku high/low/close (son kapanan gunun verisi)
+            dun_h = highs[-2] if len(highs) >= 2 else highs[-1]
+            dun_l = lows[-2]  if len(lows)  >= 2 else lows[-1]
+            dun_c = closes[-2] if len(closes) >= 2 else closes[-1]
+
+            # Bugunku intraday high/low
+            gun_h = highs[-1]
+            gun_l = lows[-1]
+
+            # 20 gunluk MA
+            ma20 = round(sum(closes[-20:]) / min(20, len(closes)), 2)
+
+            # 52 haftalik (yaklasik son 260 is gunu — elde en fazla 1 aylik data var)
+            all_h = max(highs)
+            all_l = min(lows)
+
+            pivot = self._pivot_hesapla(dun_h, dun_l, dun_c)
+            yorum = self._yorum_olustur(fiyat, pivot)
+
+            # Fiyatin pivot'a gore konumu
+            if fiyat > pivot["P"]:
+                konum = "Pivot USTUNDE"
+                konum_icon = "+"
+            else:
+                konum = "Pivot ALTINDA"
+                konum_icon = "-"
+
+            msg = (
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"🛢️ <b>BRENT TEKNİK</b>  —  {datetime.now().strftime('%H:%M')}\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"💰 Fiyat: <b>{fiyat:.2f}</b>  ({konum_icon} {konum})\n\n"
+                f"<b>Pivot Seviyeleri:</b>\n"
+                f"   R3:  <code>{pivot['R3']:.2f}</code>\n"
+                f"   R2:  <code>{pivot['R2']:.2f}</code>  ← Guclu direnc\n"
+                f"   R1:  <code>{pivot['R1']:.2f}</code>  ← Direnc\n"
+                f"   P:   <code>{pivot['P']:.2f}</code>   ← Pivot\n"
+                f"   S1:  <code>{pivot['S1']:.2f}</code>  ← Destek\n"
+                f"   S2:  <code>{pivot['S2']:.2f}</code>  ← Guclu destek\n"
+                f"   S3:  <code>{pivot['S3']:.2f}</code>\n\n"
+                f"<b>Hareketli Ortalama:</b>\n"
+                f"   MA20: <code>{ma20:.2f}</code>  "
+                f"{'(fiyat ustunde)' if fiyat > ma20 else '(fiyat altinda)'}\n\n"
+                f"<b>Gun ici:</b>\n"
+                f"   Yuksek: <code>{gun_h:.2f}</code>  "
+                f"Dusuk: <code>{gun_l:.2f}</code>\n\n"
+                f"<b>Piyasa araligi:</b>\n"
+                f"   Yuksek: <code>{all_h:.2f}</code>  "
+                f"Dusuk: <code>{all_l:.2f}</code>\n\n"
+                f"💡 {yorum}"
+            )
+            await bot.send_message(
+                chat_id=CHAT_ID, text=msg, parse_mode=ParseMode.HTML
+            )
+            log.info(f"Brent teknik gonderildi: {fiyat:.2f}")
+        except Exception as e:
+            log.warning(f"Brent teknik: {e}")
+
+brent_radar = BrentRadar()
+
+# ================================================================
+# ML MODELI — Multi-horizon labels
+# ================================================================
 class MLModel:
     def __init__(self):
         self.model      = None
@@ -443,49 +731,52 @@ class MLModel:
         self.son_egitim = None
         self.MIN_VERI   = 100
 
-    def ozellik_cikar(self, h: dict) -> list:
-        b = h.get("baslik","").lower()
+    def ozellik_cikar(self, h):
+        b = h.get("baslik", "").lower()
         t = h.get("tier", 2)
         return [
             h.get("skor", 0) / 10.0,
             h.get("novelty", 1.0),
-            len(h.get("semboller",[])) / 5.0,
+            len(h.get("semboller", [])) / 5.0,
             1.0 if h.get("yon")=="BULLISH" else (-1.0 if h.get("yon")=="BEARISH" else 0.0),
             1.0 if h.get("kaynak_tip")=="sirket" else 0.0,
-            (3 - t) / 2.0,  # tier feature: Tier1=1.0, Tier2=0.5, Tier3=0.0
-            1.0 if any(k in b for k in ["tcmb","merkez bankası","faiz"]) else 0.0,
+            (3 - t) / 2.0,
+            1.0 if any(k in b for k in ["tcmb","merkez bankasi","faiz"]) else 0.0,
             1.0 if any(k in b for k in ["deprem","afet","patlama"]) else 0.0,
-            1.0 if any(k in b for k in ["temettü","bedelsiz","geri alım","kap"]) else 0.0,
-            1.0 if any(k in b for k in ["savaş","operasyon","füze","nato"]) else 0.0,
+            1.0 if any(k in b for k in ["temettü","bedelsiz","geri alim","kap"]) else 0.0,
+            1.0 if any(k in b for k in ["savas","operasyon","fuze","nato"]) else 0.0,
             1.0 if any(k in b for k in ["petrol","brent","opec","enerji"]) else 0.0,
-            1.0 if any(k in b for k in ["dolar","kur","tl","döviz"]) else 0.0,
-            1.0 if any(k in b for k in ["fed","ecb","faiz kararı","baz puan"]) else 0.0,
-            1.0 if any(k in b for k in ["altın","gold","xau"]) else 0.0,
+            1.0 if any(k in b for k in ["dolar","kur","tl","doviz"]) else 0.0,
+            1.0 if any(k in b for k in ["fed","ecb","faiz karari","baz puan"]) else 0.0,
+            1.0 if any(k in b for k in ["altin","gold","xau"]) else 0.0,
             1.0 if h.get("scheduled_event") else 0.0,
             min(h.get("surprise", 0) or 0, 1.0),
-            min(len(h.get("baslik","")) / 200.0, 1.0),
+            min(len(h.get("baslik", "")) / 200.0, 1.0),
         ]
 
     def egit(self):
-        if not ML_AVAILABLE: return
+        if not ML_AVAILABLE:
+            return
         try:
             con  = sqlite3.connect(DB_PATH)
             rows = con.execute("""
-                SELECT ai_skor,novelty,semboller,yon,baslik,tier,scheduled_event,
-                       surprise,relative_move
+                SELECT ai_skor,novelty,semboller,yon,baslik,tier,
+                       scheduled_event,surprise,relative_move
                 FROM haberler
                 WHERE gonderildi=1 AND relative_move IS NOT NULL
             """).fetchall()
             con.close()
             if len(rows) < self.MIN_VERI:
-                log.info(f"🤖 ML: {len(rows)}/{self.MIN_VERI} — birikim devam")
+                log.info(f"ML: {len(rows)}/{self.MIN_VERI} — birikim devam")
                 return
             X, y = [], []
             for r in rows:
                 h = {
-                    "skor":r[0],"novelty":r[1],"semboller":json.loads(r[2] or "[]"),
-                    "yon":r[3],"baslik":r[4],"tier":r[5] or 2,
-                    "scheduled_event":r[6],"surprise":r[7]
+                    "skor": r[0], "novelty": r[1],
+                    "semboller": json.loads(r[2] or "[]"),
+                    "yon": r[3], "baslik": r[4],
+                    "tier": r[5] or 2,
+                    "scheduled_event": r[6], "surprise": r[7]
                 }
                 X.append(self.ozellik_cikar(h))
                 y.append(1 if (r[8] or 0) > 0.3 else 0)
@@ -495,30 +786,34 @@ class MLModel:
             self.model.fit(X, y)
             self.trained    = True
             self.son_egitim = datetime.now()
-            acc = sum(1 for i,xi in enumerate(X) if self.model.predict([xi])[0]==y[i]) / len(y)
-            log.info(f"🤖 ML eğitildi! {len(rows)} örnek | acc={acc:.2f}")
+            acc = sum(
+                1 for i, xi in enumerate(X)
+                if self.model.predict([xi])[0] == y[i]
+            ) / len(y)
+            log.info(f"ML egitildi! {len(rows)} ornek | acc={acc:.2f}")
         except Exception as e:
             log.warning(f"ML egit: {e}")
 
-    def skor(self, h: dict) -> float:
-        if not self.trained or not ML_AVAILABLE: return 0.5
+    def skor(self, h):
+        if not self.trained or not ML_AVAILABLE:
+            return 0.5
         try:
-            return round(self.model.predict_proba([self.ozellik_cikar(h)])[0][1], 3)
-        except: return 0.5
+            return round(
+                self.model.predict_proba([self.ozellik_cikar(h)])[0][1], 3
+            )
+        except:
+            return 0.5
 
-    def fiyat_guncelle(self, horizons: list[tuple[str, int]]):
-        """
-        horizons: [("move_5m", 5), ("move_15m", 15), ("move_60m", 60)]
-        Her horizon için gönderilmiş haberleri çek, fiyat değişimini kaydet
-        """
-        if not ML_AVAILABLE: return
+    def fiyat_guncelle(self, horizons):
+        if not ML_AVAILABLE:
+            return
         for field, minutes in horizons:
             try:
                 sinir_ust = (datetime.now() - timedelta(minutes=minutes-2)).isoformat()
                 sinir_alt = (datetime.now() - timedelta(minutes=minutes+5)).isoformat()
                 con  = sqlite3.connect(DB_PATH)
                 rows = con.execute(f"""
-                    SELECT id,semboller FROM haberler
+                    SELECT id, semboller FROM haberler
                     WHERE gonderildi=1 AND {field} IS NULL
                     AND timestamp BETWEEN ? AND ?
                     LIMIT 20
@@ -526,19 +821,20 @@ class MLModel:
                 con.close()
                 for haber_id, semboller_json in rows:
                     syms = json.loads(semboller_json or "[]")
-                    if not syms: continue
+                    if not syms:
+                        continue
                     try:
                         r = requests.get(
                             "https://finnhub.io/api/v1/quote",
-                            params={"symbol":f"XIST:{syms[0]}","token":FINNHUB_KEY},
+                            params={"symbol": f"XIST:{syms[0]}", "token": FINNHUB_KEY},
                             timeout=5
                         ).json()
-                        dp = r.get("dp")  # % değişim
-                        if dp is None: continue
-                        # Relative move = hisse - xu030 (yaklaşık)
+                        dp = r.get("dp")
+                        if dp is None:
+                            continue
                         xu030 = requests.get(
                             "https://finnhub.io/api/v1/quote",
-                            params={"symbol":"XIST:XU030","token":FINNHUB_KEY},
+                            params={"symbol": "XIST:XU030", "token": FINNHUB_KEY},
                             timeout=5
                         ).json().get("dp", 0) or 0
                         relative = dp - xu030
@@ -549,139 +845,76 @@ class MLModel:
                         )
                         con2.commit()
                         con2.close()
-                    except: pass
+                    except:
+                        pass
             except Exception as e:
                 log.debug(f"fiyat_guncelle {field}: {e}")
 
 ml = MLModel()
 
-# ════════════════════════════════════════════════
-# 💹 FİYAT RADAR
-# ════════════════════════════════════════════════
-class FiyatRadar:
-    def __init__(self):
-        self.onceki  = {}
-        self.ESIKLER = {"USDTRY": 0.8, "GOLD": 1.0, "BRENT": 1.5}
-
-    async def kontrol(self, bot: Bot):
-        veriler = {}
-        try:
-            for sym, label in [
-                ("OANDA:USDTRY", "USDTRY"),
-                ("OANDA:XAUUSD", "GOLD"),
-            ]:
-                r = requests.get(
-                    "https://finnhub.io/api/v1/quote",
-                    params={"symbol": sym, "token": FINNHUB_KEY}, timeout=6
-                ).json()
-                if r.get("c"): veriler[label] = r["c"]
-        except: pass
-
-        ISIMLER = {"USDTRY":"💵 USD/TRY","GOLD":"🥇 Altın (XAU/USD)","BRENT":"🛢️ Brent"}
-        ETKILER = {
-            "USDTRY": "📈 THYAO·FROTO·EREGL  |  📉 BIMAS·MGROS·ARCLK",
-            "GOLD":   "📈 KOZAL",
-            "BRENT":  "📉 TUPRS·PETKM·AYGAZ",
-        }
-        for label, fiyat in veriler.items():
-            if label in self.onceki and self.onceki[label]:
-                degisim = abs((fiyat - self.onceki[label]) / self.onceki[label] * 100)
-                if degisim >= self.ESIKLER.get(label, 1.0):
-                    yon = "📈" if fiyat > self.onceki[label] else "📉"
-                    try:
-                        await bot.send_message(
-                            chat_id=CHAT_ID,
-                            text=(
-                                f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                                f"💹 <b>FİYAT ANOMALİSİ</b> {yon}\n"
-                                f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                                f"📌 <b>{ISIMLER.get(label, label)}</b>\n"
-                                f"   Önce: <code>{self.onceki[label]:.3f}</code>\n"
-                                f"   Şimdi: <code>{fiyat:.3f}</code>\n"
-                                f"   Hareket: <b>{yon} %{degisim:.2f}</b>\n\n"
-                                f"🎯 {ETKILER.get(label,'—')}\n"
-                                f"⏰ {datetime.now().strftime('%H:%M:%S')}"
-                            ),
-                            parse_mode=ParseMode.HTML
-                        )
-                        log.info(f"💹 {label} %{degisim:.1f}")
-                    except Exception as e:
-                        log.error(f"Fiyat radar gönderme: {e}")
-            self.onceki[label] = fiyat
-
-fiyat_radar = FiyatRadar()
-
-# ════════════════════════════════════════════════
-# 📅 MACRO ENGINE — 3 Fazlı Sistem
-# ════════════════════════════════════════════════
+# ================================================================
+# MACRO ENGINE — 3 Fazli Sistem
+# ================================================================
 class MacroEngine:
-    """
-    Faz 1 — 30 dk önce: beklenti + senaryo analizi
-    Faz 2 — Veri anı: actual vs forecast + surprise score
-    Faz 3 — 5 dk sonra: piyasa tepkisi
-    """
     def __init__(self):
-        self.sent_pre      = set()    # pre-release gönderildi
-        self.sent_release  = set()    # release gönderildi
-        self.sent_reaction = set()    # reaction gönderildi
-        self.reaction_queue: list[dict] = []  # 5dk bekleme listesi
+        self.sent_pre      = set()
+        self.sent_release  = set()
+        self.sent_reaction = set()
+        self.reaction_queue = []
 
-        # Türkiye + önemli global etkinlikler için BIST etkisi
         self.EVENT_CONTEXT = {
-            # Türkiye
-            "Turkey CPI":              ("🇹🇷", ["GARAN","AKBNK","ISCTR","YKBNK","BIMAS"], "TL, bankalar, tüketim"),
-            "Turkey PPI":              ("🇹🇷", ["TUPRS","EREGL","FROTO"], "Sanayi, üretim maliyeti"),
-            "Turkey Unemployment":     ("🇹🇷", ["BIMAS","MGROS","ULKER"], "Tüketim hisseleri"),
-            "Turkey Current Account":  ("🇹🇷", ["XU030"], "TL ve endeks"),
-            "Turkey Industrial Production":("🇹🇷", ["EREGL","FROTO","TOASO"], "Sanayi"),
-            "Turkey GDP":              ("🇹🇷", ["XU030","GARAN","AKBNK"], "Endeks geneli"),
-            "Turkey Trade Balance":    ("🇹🇷", ["FROTO","TOASO","EREGL"], "İhracatçılar"),
-            "Turkey Interest Rate":    ("🇹🇷", ["GARAN","AKBNK","ISCTR","YKBNK","XU030"], "TÜM PİYASA — EN KRİTİK"),
-            "Turkey Budget Balance":   ("🇹🇷", ["XU030"], "Genel endeks"),
-            "Turkey Capacity Utilization": ("🇹🇷", ["SISE","ARCLK","FROTO"], "Sanayi"),
-            "Turkey Consumer Confidence": ("🇹🇷", ["BIMAS","MGROS","ARCLK"], "Perakende"),
-            "Turkey Inflation Rate":   ("🇹🇷", ["GARAN","AKBNK","ISCTR","YKBNK"], "Bankalar, TRY"),
-            # ABD
-            "United States Non Farm Payrolls": ("🇺🇸", ["XU030"], "Gelişen piyasalar, risk"),
-            "United States CPI":       ("🇺🇸", ["XU030","KOZAL"], "Global risk-off, altın"),
-            "United States PPI":       ("🇺🇸", ["XU030"], "Enflasyon beklentisi"),
-            "United States Interest Rate": ("🇺🇸", ["XU030","GARAN","AKBNK"], "Fed faiz → TÜM GELİŞEN PİYASA"),
-            "United States GDP":       ("🇺🇸", ["XU030"], "Global büyüme beklentisi"),
-            "United States Unemployment Rate": ("🇺🇸", ["XU030"], "ABD işgücü, risk iştahı"),
-            "United States PMI":       ("🇺🇸", ["XU030"], "Global aktivite"),
-            "United States ADP Employment": ("🇺🇸", ["XU030"], "NFP öncü göstergesi"),
-            "United States Initial Jobless Claims": ("🇺🇸", ["XU030"], "Haftalık istihdam"),
-            "United States Retail Sales": ("🇺🇸", ["XU030"], "Tüketim"),
+            "Turkey CPI":               ("TR", ["GARAN","AKBNK","ISCTR","YKBNK","BIMAS"], "TL, bankalar, tuketim"),
+            "Turkey PPI":               ("TR", ["TUPRS","EREGL","FROTO"], "Sanayi maliyet"),
+            "Turkey Unemployment":      ("TR", ["BIMAS","MGROS","ULKER"], "Tuketim hisseleri"),
+            "Turkey Current Account":   ("TR", ["XU030"], "TL ve endeks"),
+            "Turkey Industrial Production": ("TR", ["EREGL","FROTO","TOASO"], "Sanayi"),
+            "Turkey GDP":               ("TR", ["XU030","GARAN","AKBNK"], "Endeks geneli"),
+            "Turkey Trade Balance":     ("TR", ["FROTO","TOASO","EREGL"], "Ihracatcilar"),
+            "Turkey Interest Rate":     ("TR", ["GARAN","AKBNK","ISCTR","YKBNK","XU030"], "TUM PIYASA — EN KRITIK"),
+            "Turkey Budget Balance":    ("TR", ["XU030"], "Genel endeks"),
+            "Turkey Capacity Utilization": ("TR", ["SISE","ARCLK","FROTO"], "Sanayi"),
+            "Turkey Consumer Confidence":("TR", ["BIMAS","MGROS","ARCLK"], "Perakende"),
+            "Turkey Inflation Rate":    ("TR", ["GARAN","AKBNK","ISCTR","YKBNK"], "Bankalar, TRY"),
+            "United States Non Farm Payrolls": ("US", ["XU030"], "Gelisen piyasalar, risk"),
+            "United States CPI":        ("US", ["XU030","KOZAL"], "Global risk-off, altin"),
+            "United States PPI":        ("US", ["XU030"], "Enflasyon beklentisi"),
+            "United States Interest Rate": ("US", ["XU030","GARAN","AKBNK"], "Fed faiz — TUM GELISEN PIYASA"),
+            "United States GDP":        ("US", ["XU030"], "Global buyume"),
+            "United States Unemployment Rate": ("US", ["XU030"], "ABD isgucu"),
+            "United States PMI":        ("US", ["XU030"], "Global aktivite"),
+            "United States ADP Employment": ("US", ["XU030"], "NFP oncul gostergesi"),
+            "United States Initial Jobless Claims": ("US", ["XU030"], "Haftalik istihdam"),
+            "United States Retail Sales": ("US", ["XU030"], "Tuketim"),
         }
 
         self.SENARYO = {
             "Turkey CPI": {
-                "yuksek": "TL üzerinde baskı, bankalar negatif, TCMB sıkılaşma beklentisi artar",
-                "dusuk":  "TL'ye destek, bankalar pozitif, TCMB gevşeme yolu açılır"
+                "yuksek": "TL uzerinde baski, bankalar negatif, TCMB sikılasma beklentisi artar",
+                "dusuk":  "TL'ye destek, bankalar pozitif, TCMB gevşeme yolu acilir"
             },
             "Turkey Interest Rate": {
-                "yuksek": "Bankalar baskı, TL güçlenir, endeks düşer",
-                "dusuk":  "Bankalar rallisi, TL zayıflar, endeks yükselir"
+                "yuksek": "Bankalar baski, TL guclenir, endeks dusuyor olabilir",
+                "dusuk":  "Bankalar rallisi, TL zayiflar, endeks yukselir"
             },
             "United States Non Farm Payrolls": {
-                "yuksek": "Fed sıkılık, USD güçlenir, EM satışı, BIST negatif",
-                "dusuk":  "Fed gevşeme beklentisi, EM alım, BIST pozitif"
+                "yuksek": "Fed sikiligi, USD guclenir, EM satisi, BIST negatif",
+                "dusuk":  "Fed gevşeme beklentisi, EM alim, BIST pozitif"
             },
             "United States CPI": {
-                "yuksek": "Fed hawkish, USD güçlenir, altın düşer, BIST negatif",
-                "dusuk":  "Fed dovish, USD zayıflar, altın yükselir, BIST pozitif"
+                "yuksek": "Fed hawkish, USD guclenir, altin dusuyor, BIST negatif",
+                "dusuk":  "Fed dovish, USD zayiflar, altin yukselir, BIST pozitif"
             },
             "United States Interest Rate": {
-                "yuksek": "EM çıkış, USD güçlenir, BIST baskı",
-                "dusuk":  "EM giriş, risk iştahı artar, BIST pozitif"
+                "yuksek": "EM cikis, USD guclenir, BIST baski",
+                "dusuk":  "EM giris, risk istahi artar, BIST pozitif"
             },
         }
 
-    async def kontrol(self, bot: Bot):
+    async def kontrol(self, bot):
         await self._finnhub_kontrol(bot)
         await self._reaction_kontrol(bot)
 
-    async def _finnhub_kontrol(self, bot: Bot):
+    async def _finnhub_kontrol(self, bot):
         bugun = datetime.now().strftime("%Y-%m-%d")
         yarin = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
         try:
@@ -691,13 +924,12 @@ class MacroEngine:
                 timeout=10
             ).json()
             for ev in r.get("economicCalendar", []):
-                country   = ev.get("country", "")
-                impact    = ev.get("impact", "")
-                event_name= ev.get("event", "")
+                country    = ev.get("country", "")
+                impact     = ev.get("impact", "")
+                event_name = ev.get("event", "")
 
-                # Sadece Türkiye + Yüksek etkili ABD verilerini işle
                 if country == "TR":
-                    pass  # Tüm TR olayları
+                    pass
                 elif country == "US" and impact in ["high", "medium"]:
                     pass
                 else:
@@ -710,7 +942,7 @@ class MacroEngine:
 
                 await self._process_event(bot, ev, ev_time, event_name, country, impact)
         except Exception as e:
-            log.debug(f"MacroEngine Finnhub: {e}")
+            log.debug(f"MacroEngine: {e}")
 
     async def _process_event(self, bot, ev, ev_time, event_name, country, impact):
         now      = datetime.now()
@@ -720,7 +952,6 @@ class MacroEngine:
         actual   = ev.get("actual")
         ev_key   = f"{country}_{event_name}_{ev_time.strftime('%Y%m%d')}"
 
-        # Faz 1 — 30 dk önce uyarı
         if 25 <= diff_min <= 35:
             key = f"pre_{ev_key}"
             if key not in self.sent_pre:
@@ -728,17 +959,16 @@ class MacroEngine:
                 await self._send_pre(bot, ev_time, event_name, country, impact,
                                      forecast, previous)
 
-        # Faz 2 — Veri açıklandı (actual geldi, event time geçti)
         elif diff_min < 5 and actual is not None and str(actual).strip() not in ("", "0"):
             key = f"release_{ev_key}"
             if key not in self.sent_release:
                 self.sent_release.add(key)
-                # SQLite'a kaydet
                 try:
                     surprise = None
-                    if forecast and forecast != 0:
-                        surprise = (float(actual) - float(forecast)) / abs(float(forecast))
+                    if forecast and float(str(forecast)) != 0:
+                        surprise = (float(str(actual)) - float(str(forecast))) / abs(float(str(forecast)))
                     con = sqlite3.connect(DB_PATH)
+                    ctx_syms = self.EVENT_CONTEXT.get(event_name, ("","[]",""))[1]
                     con.execute("""
                         INSERT OR REPLACE INTO macro_events
                         (event_key,timestamp,country,event_name,importance,
@@ -747,26 +977,27 @@ class MacroEngine:
                     """, (
                         ev_key, datetime.now().isoformat(), country, event_name,
                         impact, forecast, previous, actual, surprise, "release",
-                        json.dumps(self.EVENT_CONTEXT.get(event_name, ("","[]",""))[1])
+                        json.dumps(ctx_syms)
                     ))
                     con.commit()
                     con.close()
-                except: pass
+                except:
+                    pass
                 await self._send_release(bot, ev_time, event_name, country, impact,
                                          actual, forecast, previous)
-                # 5 dk tepki kuyruğu
+                ctx = self.EVENT_CONTEXT.get(event_name, ("","[]",""))
                 self.reaction_queue.append({
-                    "queued_at": now,
+                    "queued_at":  now,
                     "event_name": event_name,
-                    "country": country,
-                    "actual": actual,
-                    "forecast": forecast,
-                    "key": f"reaction_{ev_key}",
-                    "symbols": self.EVENT_CONTEXT.get(event_name, ("","[]",""))[1],
+                    "country":    country,
+                    "actual":     actual,
+                    "forecast":   forecast,
+                    "key":        f"reaction_{ev_key}",
+                    "symbols":    ctx[1],
                 })
 
-    async def _reaction_kontrol(self, bot: Bot):
-        now = datetime.now()
+    async def _reaction_kontrol(self, bot):
+        now   = datetime.now()
         kalan = []
         for item in self.reaction_queue:
             elapsed = (now - item["queued_at"]).total_seconds() / 60
@@ -779,73 +1010,70 @@ class MacroEngine:
 
     async def _send_pre(self, bot, ev_time, event_name, country, impact,
                          forecast, previous):
-        ctx    = self.EVENT_CONTEXT.get(event_name, ("🌍", [], "—"))
-        flag   = ctx[0]
-        syms   = "  ".join([f"<code>{s}</code>" for s in ctx[1][:5]]) or "—"
-        ozet   = ctx[2]
-        impact_icon = "🔴" if impact == "high" else "🟡"
-
-        senaryo = self.SENARYO.get(event_name)
+        ctx         = self.EVENT_CONTEXT.get(event_name, ("", [], "—"))
+        flag        = "TR" if country == "TR" else "US"
+        syms        = "  ".join([f"<code>{s}</code>" for s in ctx[1][:5]]) or "—"
+        ozet        = ctx[2]
+        impact_icon = "Cok Yuksek" if impact == "high" else "Orta"
+        senaryo     = self.SENARYO.get(event_name)
         senaryo_str = ""
         if senaryo:
             senaryo_str = (
                 f"\n\n<b>Senaryolar:</b>\n"
-                f"📈 Yüksek gelirse: {senaryo['yuksek']}\n"
-                f"📉 Düşük gelirse: {senaryo['dusuk']}"
+                f"Yuksek gelirse: {senaryo['yuksek']}\n"
+                f"Dusuk gelirse:  {senaryo['dusuk']}"
             )
-
-        tahmin_str = f"Beklenti: <code>{forecast}</code>  " if forecast else ""
-        onceki_str = f"Önceki: <code>{previous}</code>" if previous else ""
-
+        t_str = f"Beklenti: <code>{forecast}</code>  " if forecast else ""
+        p_str = f"Onceki: <code>{previous}</code>"    if previous else ""
         try:
             await bot.send_message(
                 chat_id=CHAT_ID,
                 text=(
                     f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"⏰ <b>30 DAKİKA SONRA</b>  {flag}\n"
+                    f"⏰ <b>30 DAKIKA SONRA</b>  [{flag}]\n"
                     f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
                     f"📋 <b>{event_name}</b>\n"
-                    f"🕐 <code>{ev_time.strftime('%H:%M')}</code>  {impact_icon} {impact.upper()}\n\n"
-                    f"{tahmin_str}{onceki_str}\n\n"
-                    f"🎯 Etkilenecek: {syms}\n"
-                    f"📌 {ozet}"
+                    f"Saat: <code>{ev_time.strftime('%H:%M')}</code>  —  {impact_icon}\n\n"
+                    f"{t_str}{p_str}\n\n"
+                    f"Etkilenecek: {syms}\n"
+                    f"{ozet}"
                     f"{senaryo_str}"
                 ),
                 parse_mode=ParseMode.HTML
             )
-            log.info(f"⏰ Pre-release: {event_name}")
+            log.info(f"Pre-release: {event_name}")
         except Exception as e:
             log.error(f"send_pre: {e}")
 
     async def _send_release(self, bot, ev_time, event_name, country, impact,
                              actual, forecast, previous):
-        flag = self.EVENT_CONTEXT.get(event_name, ("🌍",))[0]
-        ctx  = self.EVENT_CONTEXT.get(event_name, ("🌍", [], "—"))
+        ctx  = self.EVENT_CONTEXT.get(event_name, ("", [], "—"))
         syms = "  ".join([f"<code>{s}</code>" for s in ctx[1][:5]]) or "—"
 
-        surprise_str = ""
+        surprise_str  = ""
         surprise_icon = ""
         if forecast and str(forecast).strip() not in ("", "0"):
             try:
-                surprise = float(actual) - float(forecast)
-                pct      = surprise / abs(float(forecast))
+                surprise = float(str(actual)) - float(str(forecast))
+                pct      = surprise / abs(float(str(forecast)))
                 if pct > 0.05:
-                    surprise_icon = "🔥 BEKLENTIDEN SICAK"
-                    surprise_str  = f"Sürpriz: <b>+{surprise:.3f} ({pct*100:.1f}%)</b> ↑"
+                    surprise_icon = "BEKLENTIDEN SICAK"
+                    surprise_str  = f"Surpriz: <b>+{surprise:.3f} (%{pct*100:.1f})</b>"
                 elif pct < -0.05:
-                    surprise_icon = "🧊 BEKLENTIDEN SOĞUK"
-                    surprise_str  = f"Sürpriz: <b>{surprise:.3f} ({pct*100:.1f}%)</b> ↓"
+                    surprise_icon = "BEKLENTIDEN SOGUK"
+                    surprise_str  = f"Surpriz: <b>{surprise:.3f} (%{pct*100:.1f})</b>"
                 else:
-                    surprise_icon = "➡️ BEKLENTIYE YAKIN"
-                    surprise_str  = f"Sürpriz: <b>{surprise:+.3f}</b>"
-            except: pass
+                    surprise_icon = "BEKLENTIYE YAKIN"
+                    surprise_str  = f"Surpriz: <b>{surprise:+.3f}</b>"
+            except:
+                pass
 
         try:
             await bot.send_message(
                 chat_id=CHAT_ID,
                 text=(
                     f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"📊 <b>VERİ GELDİ</b>  {flag}\n"
+                    f"📊 <b>VERI GELDI</b>  [{country}]\n"
                     f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
                     f"📋 <b>{event_name}</b>\n\n"
                     f"Actual:   <b><code>{actual}</code></b>\n"
@@ -853,37 +1081,38 @@ class MacroEngine:
                     f"Previous: <code>{previous or '—'}</code>\n\n"
                     f"{surprise_str}\n"
                     f"<b>{surprise_icon}</b>\n\n"
-                    f"🎯 Etkilenecek: {syms}\n"
-                    f"⏰ 5 dk içinde piyasa tepkisi gelecek..."
+                    f"Etkilenecek: {syms}\n"
+                    f"5 dk icinde piyasa tepkisi geliyor..."
                 ),
                 parse_mode=ParseMode.HTML
             )
-            log.info(f"📊 Release: {event_name} actual={actual}")
+            log.info(f"Release: {event_name} actual={actual}")
         except Exception as e:
             log.error(f"send_release: {e}")
 
     async def _send_reaction(self, bot, item):
-        symbols = item.get("symbols", [])
+        symbols   = item.get("symbols", [])
         reactions = []
-        # USDTRY tepkisi
         try:
             r = requests.get(
                 "https://finnhub.io/api/v1/quote",
-                params={"symbol": "OANDA:USDTRY", "token": FINNHUB_KEY}, timeout=5
+                params={"symbol": "OANDA:USDTRY", "token": FINNHUB_KEY},
+                timeout=5
             ).json()
             if r.get("dp"):
-                reactions.append(f"💵 USD/TRY: <b>{r['dp']:+.2f}%</b>")
-        except: pass
-        # Altın
+                reactions.append(f"USD/TRY: <b>{r['dp']:+.2f}%</b>")
+        except:
+            pass
         try:
             r = requests.get(
                 "https://finnhub.io/api/v1/quote",
-                params={"symbol": "OANDA:XAUUSD", "token": FINNHUB_KEY}, timeout=5
+                params={"symbol": "OANDA:XAUUSD", "token": FINNHUB_KEY},
+                timeout=5
             ).json()
             if r.get("dp"):
-                reactions.append(f"🥇 Altın: <b>{r['dp']:+.2f}%</b>")
-        except: pass
-        # İlgili hisse (ilk sembol)
+                reactions.append(f"Altin: <b>{r['dp']:+.2f}%</b>")
+        except:
+            pass
         if symbols:
             try:
                 r = requests.get(
@@ -892,68 +1121,66 @@ class MacroEngine:
                     timeout=5
                 ).json()
                 if r.get("dp"):
-                    reactions.append(f"📈 {symbols[0]}: <b>{r['dp']:+.2f}%</b>")
-            except: pass
-
+                    reactions.append(f"{symbols[0]}: <b>{r['dp']:+.2f}%</b>")
+            except:
+                pass
         if not reactions:
             return
-
-        reaction_text = "\n".join(reactions)
         try:
             await bot.send_message(
                 chat_id=CHAT_ID,
                 text=(
                     f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"⚡ <b>İLK PİYASA TEPKİSİ</b> (5 dk)\n"
+                    f"⚡ <b>ILK PIYASA TEPKISI</b> (5 dk)\n"
                     f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
                     f"📋 <b>{item['event_name']}</b>\n\n"
-                    f"{reaction_text}\n\n"
-                    f"⏰ {datetime.now().strftime('%H:%M:%S')}"
+                    + "\n".join(reactions) +
+                    f"\n\n⏰ {datetime.now().strftime('%H:%M:%S')}"
                 ),
                 parse_mode=ParseMode.HTML
             )
-            log.info(f"⚡ Reaction: {item['event_name']}")
+            log.info(f"Reaction: {item['event_name']}")
         except Exception as e:
             log.error(f"send_reaction: {e}")
 
 macro_engine = MacroEngine()
 
-# ════════════════════════════════════════════════
-# ⚡ MOMENTUM RADAR
-# ════════════════════════════════════════════════
+# ================================================================
+# MOMENTUM RADAR
+# ================================================================
 class MomentumRadar:
     def __init__(self):
-        self.kume         = defaultdict(list)
-        self.PENCERE_DK   = 15
-        self.ESIK_ORTA    = 3
-        self.ESIK_KRITIK  = 5
-        self.gonderilen   = set()
+        self.kume        = defaultdict(list)
+        self.PENCERE_DK  = 15
+        self.ESIK_ORTA   = 3
+        self.ESIK_KRITIK = 5
+        self.gonderilen  = set()
         self.KUMELER = {
-            "İsrail-İran":    ["israel","iran","tel aviv","tehran","idf","hamas","hizbullah"],
-            "Ukrayna-Rusya":  ["ukrayna","rusya","ukraine","russia","putin","zelensky"],
-            "Fed-Faiz":       ["fomc","powell","federal reserve rate","fed rate decision"],
-            "TCMB-Faiz":      ["tcmb faiz","ppk kararı","para politikası toplantı"],
-            "Petrol-Enerji":  ["brent +","petrol fiyat arttı","opec acil","hürmüz kapandı"],
-            "TL-Kriz":        ["tl kriz","dolar tavan","lira çöküş","kur saldırı"],
-            "Altın":          ["altın rekor","gold rally","xau yükseldi","ons fiyat"],
-            "Deprem":         ["büyük deprem","şiddetli deprem","earthquake m"],
-            "Çin-Ekonomi":    ["çin ekonomi","china gdp","pboc","yuan"],
-            "Savunma-ASELS":  ["aselsan","savunma ihalesi","siha sözleşme","ssb projesi"],
+            "Israil-Iran":   ["israel","iran","tel aviv","tehran","idf","hamas","hizbullah","gaza"],
+            "Ukrayna-Rusya": ["ukrayna","rusya","ukraine","russia","putin","zelensky"],
+            "Fed-Faiz":      ["fomc","powell","federal reserve rate","fed rate decision"],
+            "TCMB-Faiz":     ["tcmb faiz","ppk karari","para politikasi toplanti"],
+            "Petrol-Enerji": ["brent +","petrol fiyat artti","opec acil","hurmuz"],
+            "TL-Kriz":       ["tl kriz","dolar tavan","lira cokus"],
+            "Altin":         ["altin rekor","gold rally","xau yukseldi"],
+            "Deprem":        ["buyuk deprem","siddetli deprem","earthquake m"],
+            "Cin-Ekonomi":   ["cin ekonomi","china gdp","pboc","yuan"],
+            "Savunma-ASELS": ["aselsan","savunma ihalesi","siha sozlesme","ssb projesi"],
         }
         self.ETKILENENLER = {
-            "İsrail-İran":   "ASELS · KOZAL · TUPRS · PETKM",
-            "Ukrayna-Rusya": "ASELS · TUPRS · EREGL",
-            "Fed-Faiz":      "XU030 · Bankalar · USD/TRY",
-            "TCMB-Faiz":     "GARAN · AKBNK · ISCTR · YKBNK",
-            "Petrol-Enerji": "TUPRS · PETKM · AYGAZ",
-            "TL-Kriz":       "THYAO·FROTO·EREGL ↑  |  BIMAS·MGROS ↓",
-            "Altın":         "KOZAL",
-            "Deprem":        "EKGYO · ENKAI",
-            "Çin-Ekonomi":   "EREGL · PETKM · ihracatçılar",
+            "Israil-Iran":   "ASELS  KOZAL  TUPRS  PETKM",
+            "Ukrayna-Rusya": "ASELS  TUPRS  EREGL",
+            "Fed-Faiz":      "XU030  Bankalar  USD/TRY",
+            "TCMB-Faiz":     "GARAN  AKBNK  ISCTR  YKBNK",
+            "Petrol-Enerji": "TUPRS  PETKM  AYGAZ",
+            "TL-Kriz":       "THYAO / FROTO / EREGL (pozitif)  |  BIMAS / MGROS (negatif)",
+            "Altin":         "KOZAL",
+            "Deprem":        "EKGYO  ENKAI",
+            "Cin-Ekonomi":   "EREGL  PETKM  ihracatcilar",
             "Savunma-ASELS": "ASELS",
         }
 
-    def ekle(self, baslik: str):
+    def ekle(self, baslik):
         b = baslik.lower()
         for kume_adi, keywords in self.KUMELER.items():
             if any(kw in b for kw in keywords):
@@ -962,43 +1189,45 @@ class MomentumRadar:
     def _temizle(self):
         sinir = datetime.now() - timedelta(minutes=self.PENCERE_DK)
         for k in list(self.kume.keys()):
-            self.kume[k] = [(b,t) for b,t in self.kume[k] if t > sinir]
+            self.kume[k] = [(b, t) for b, t in self.kume[k] if t > sinir]
 
-    def kontrol(self) -> list:
+    def kontrol(self):
         self._temizle()
         alarmlar = []
         for kume_adi, haberler in self.kume.items():
             n = len(haberler)
-            if n < self.ESIK_ORTA: continue
+            if n < self.ESIK_ORTA:
+                continue
             anahtar = f"{kume_adi}_{n // self.ESIK_ORTA}"
-            if anahtar in self.gonderilen: continue
+            if anahtar in self.gonderilen:
+                continue
             self.gonderilen.add(anahtar)
             alarmlar.append((kume_adi, n, haberler[-3:]))
         if len(self.gonderilen) > 300:
             self.gonderilen = set(list(self.gonderilen)[-150:])
         return alarmlar
 
-    def alarm_mesaj(self, kume_adi: str, n: int, son_h: list) -> str:
-        ikon    = "🔥" if n >= self.ESIK_KRITIK else "⚡"
-        seviye  = "KRİTİK MOMENTUM" if n >= self.ESIK_KRITIK else "HIZLANIYOR"
-        etki    = self.ETKILENENLER.get(kume_adi, "BIST geneli")
-        haberler_str = "".join([f"  • {b[:80]}\n" for b,_ in son_h])
+    def alarm_mesaj(self, kume_adi, n, son_h):
+        ikon   = "KRITIK MOMENTUM" if n >= self.ESIK_KRITIK else "HIZLANIYOR"
+        prefix = "🔥" if n >= self.ESIK_KRITIK else "⚡"
+        etki   = self.ETKILENENLER.get(kume_adi, "BIST geneli")
+        haberler_str = "".join([f"  - {b[:80]}\n" for b, _ in son_h])
         return (
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"{ikon} <b>{seviye}</b>\n"
+            f"{prefix} <b>{ikon}</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"📌 Konu: <b>{kume_adi}</b>\n"
-            f"📊 Son {self.PENCERE_DK} dakika: <b>{n} haber</b>\n\n"
-            f"📰 Son haberler:\n{haberler_str}\n"
-            f"🎯 Etkilenecek: {etki}\n"
+            f"Konu: <b>{kume_adi}</b>\n"
+            f"Son {self.PENCERE_DK} dk: <b>{n} haber</b>\n\n"
+            f"Son haberler:\n{haberler_str}\n"
+            f"Etkilenecek: {etki}\n"
             f"⏰ {datetime.now().strftime('%H:%M:%S')}"
         )
 
 momentum = MomentumRadar()
 
-# ════════════════════════════════════════════════
-# 🧠 NOVELTY MEMORY
-# ════════════════════════════════════════════════
+# ================================================================
+# NOVELTY MEMORY
+# ================================================================
 class NoveltyMemory:
     def __init__(self):
         self.memory = defaultdict(list)
@@ -1006,26 +1235,27 @@ class NoveltyMemory:
     def _temizle(self):
         sinir = datetime.now() - timedelta(hours=NOVELTY_HOURS)
         for e in list(self.memory.keys()):
-            self.memory[e] = [(kws,ts) for kws,ts in self.memory[e] if ts > sinir]
+            self.memory[e] = [(kws, ts) for kws, ts in self.memory[e] if ts > sinir]
 
-    def skorla(self, entity: str, baslik: str) -> float:
+    def skorla(self, entity, baslik):
         self._temizle()
-        kws = set(re.findall(r'\w{4,}', baslik.lower()))
+        kws    = set(re.findall(r'\w{4,}', baslik.lower()))
         max_ov = 0.0
         for gecmis_kws, _ in self.memory.get(entity, []):
             if kws and gecmis_kws:
-                ov = len(kws & gecmis_kws) / max(len(kws), len(gecmis_kws))
+                ov     = len(kws & gecmis_kws) / max(len(kws), len(gecmis_kws))
                 max_ov = max(max_ov, ov)
         self.memory[entity].append((kws, datetime.now()))
         if max_ov > 0.65: return 0.15
         if max_ov > 0.35: return 0.55
         return 1.0
 
-    def entity_bul(self, baslik: str) -> list:
-        b = baslik.lower()
+    def entity_bul(self, baslik):
+        b   = baslik.lower()
         out = []
         for t in BIST30:
-            if t.lower() in b: out.append(t)
+            if t.lower() in b:
+                out.append(t)
         for t, vs in ENTITY_DICT.items():
             if t not in out:
                 for v in vs:
@@ -1036,16 +1266,16 @@ class NoveltyMemory:
 
 nov = NoveltyMemory()
 
-# ════════════════════════════════════════════════
-# 📡 RSS KAYNAKLARI
-# ════════════════════════════════════════════════
+# ================================================================
+# RSS KAYNAKLARI
+# ================================================================
 RSS_GLOBAL = [
     ("Reuters",         "https://feeds.reuters.com/reuters/topNews"),
     ("Reuters Biz",     "https://feeds.reuters.com/reuters/businessNews"),
     ("Reuters EM",      "https://feeds.reuters.com/reuters/emergingMarketsNews"),
-    ("Reuters Dünya",   "https://feeds.reuters.com/reuters/worldNews"),
+    ("Reuters Dunya",   "https://feeds.reuters.com/reuters/worldNews"),
     ("AP News",         "https://rsshub.app/apnews/topics/ap-top-news"),
-    ("BBC Dünya",       "https://feeds.bbci.co.uk/news/world/rss.xml"),
+    ("BBC Dunya",       "https://feeds.bbci.co.uk/news/world/rss.xml"),
     ("BBC Ekonomi",     "https://feeds.bbci.co.uk/news/business/rss.xml"),
     ("CNBC",            "https://www.cnbc.com/id/100003114/device/rss/rss.html"),
     ("CNBC Markets",    "https://www.cnbc.com/id/15839135/device/rss/rss.html"),
@@ -1058,7 +1288,7 @@ RSS_GLOBAL = [
     ("Al Monitor TR",   "https://www.al-monitor.com/rss/turkey.xml"),
     ("Al Monitor ME",   "https://www.al-monitor.com/rss/mideast.xml"),
     ("IAEA",            "https://www.iaea.org/feeds/topstories.xml"),
-    ("ABD Dışişleri",   "https://www.state.gov/rss-feed/press-releases/feed/"),
+    ("ABD Disisleri",   "https://www.state.gov/rss-feed/press-releases/feed/"),
     ("NATO",            "https://www.nato.int/cps/en/natolive/news.rss"),
     ("USGS Deprem",     "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/4.5_day.atom"),
     ("IMF",             "https://www.imf.org/en/News/rss?language=eng"),
@@ -1070,46 +1300,56 @@ RSS_TURKEY = [
     ("SPK",             "https://www.spk.gov.tr/rss/HaberDetay"),
     ("BDDK",            "https://www.bddk.org.tr/Rss/RssDuyuru"),
     ("Hazine",          "https://www.hmb.gov.tr/rss"),
-    ("Borsa İstanbul",  "https://www.borsaistanbul.com/tr/rss/haberler"),
+    ("Borsa Istanbul",  "https://www.borsaistanbul.com/tr/rss/haberler"),
     ("Resmi Gazete",    "https://www.resmigazete.gov.tr/rss/tum.xml"),
     ("BTK",             "https://www.btk.gov.tr/rss"),
     ("Rekabet Kurumu",  "https://www.rekabet.gov.tr/tr/Rss/Karar"),
     ("AA Ekonomi",      "https://www.aa.com.tr/tr/rss/default?cat=ekonomi"),
-    ("AA Gündem",       "https://www.aa.com.tr/tr/rss/default?cat=gundem"),
+    ("AA Gundem",       "https://www.aa.com.tr/tr/rss/default?cat=gundem"),
     ("DHA Ekonomi",     "https://www.dha.com.tr/rss/ekonomi.xml"),
     ("Bloomberg HT",    "https://www.bloomberght.com/rss"),
-    ("Dünya",           "https://www.dunya.com/rss/rss.xml"),
+    ("Dunya",           "https://www.dunya.com/rss/rss.xml"),
     ("Ekonomim",        "https://www.ekonomim.com/rss"),
     ("Para Analiz",     "https://www.paraanaliz.com/feed/"),
-    ("Finans Gündem",   "https://www.finansgundem.com/rss"),
+    ("Finans Gundem",   "https://www.finansgundem.com/rss"),
     ("Anka Haber",      "https://www.ankahaber.net/rss.xml"),
     ("NTV Ekonomi",     "https://www.ntv.com.tr/ekonomi.rss"),
-    ("Hürriyet Ekon",   "https://www.hurriyet.com.tr/rss/ekonomi"),
+    ("Hurriyet Ekon",   "https://www.hurriyet.com.tr/rss/ekonomi"),
     ("Sabah Ekonomi",   "https://www.sabah.com.tr/rss/ekonomi.xml"),
-    ("Sözcü Ekonomi",   "https://www.sozcu.com.tr/rss/ekonomi.xml"),
+    ("Sozcu Ekonomi",   "https://www.sozcu.com.tr/rss/ekonomi.xml"),
 ]
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                   "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "application/rss+xml, application/xml, text/xml, */*",
+    "Accept":     "application/rss+xml, application/xml, text/xml, */*",
 }
 
-# ════════════════════════════════════════════════
-# 📥 TOPLAYICILAR
-# ════════════════════════════════════════════════
-def yeni_h(kaynak: str, baslik: str, url: str, tip: str = "rss") -> dict:
+# ================================================================
+# TOPLAYICILAR
+# ================================================================
+def yeni_h(kaynak, baslik, url, tip="rss"):
     tier = kaynak_tier(kaynak)
     return {
-        "kaynak": kaynak, "baslik": baslik.strip()[:260],
-        "url": url, "zaman": datetime.now().strftime("%H:%M"),
-        "skor": 0, "ml_skor": 0.5, "yon": "NÖTR",
-        "semboller": [], "sektor_ozet": "", "stream": "NEWS",
-        "ozet": "", "novelty": 1.0, "kaynak_tip": tip,
-        "tier": tier, "scheduled_event": False, "surprise": None,
+        "kaynak":          kaynak,
+        "baslik":          baslik.strip()[:260],
+        "url":             url,
+        "zaman":           datetime.now().strftime("%H:%M"),
+        "skor":            0,
+        "ml_skor":         0.5,
+        "yon":             "NOTR",
+        "semboller":       [],
+        "sektor_ozet":     "",
+        "stream":          "NEWS",
+        "ozet":            "",
+        "novelty":         1.0,
+        "kaynak_tip":      tip,
+        "tier":            tier,
+        "scheduled_event": False,
+        "surprise":        None,
     }
 
-def rss_cek(feeds: list) -> list:
+def rss_cek(feeds):
     out = []
     for kaynak, url in feeds:
         try:
@@ -1122,7 +1362,7 @@ def rss_cek(feeds: list) -> list:
             log.debug(f"RSS {kaynak}: {e}")
     return out
 
-def marketaux_cek() -> list:
+def marketaux_cek():
     out = []
     try:
         r = requests.get(
@@ -1132,18 +1372,19 @@ def marketaux_cek() -> list:
             timeout=12, headers=HEADERS
         )
         for item in r.json().get("data", []):
-            b = item.get("title","")
-            if not b: continue
+            b = item.get("title", "")
+            if not b:
+                continue
             syms = [e.get("symbol","") for e in item.get("entities",[])
-                   if e.get("exchange","") in ["BIST","XIST","IST"] and e.get("symbol")]
-            h = yeni_h("Marketaux", b, item.get("url",""), "api")
+                    if e.get("exchange","") in ["BIST","XIST","IST"] and e.get("symbol")]
+            h            = yeni_h("Marketaux", b, item.get("url",""), "api")
             h["semboller"] = syms[:4]
             out.append(h)
     except Exception as e:
         log.warning(f"Marketaux: {e}")
     return out
 
-def finnhub_genel_cek() -> list:
+def finnhub_genel_cek():
     out = []
     try:
         r = requests.get(
@@ -1152,14 +1393,14 @@ def finnhub_genel_cek() -> list:
             timeout=10, headers=HEADERS
         )
         for item in r.json()[:10]:
-            b = item.get("headline","")
+            b = item.get("headline", "")
             if b:
                 out.append(yeni_h(item.get("source","Finnhub"), b, item.get("url",""), "api"))
     except Exception as e:
         log.warning(f"Finnhub genel: {e}")
     return out
 
-def finnhub_bist_cek() -> list:
+def finnhub_bist_cek():
     out   = []
     dun   = (datetime.now() - timedelta(days=3)).strftime("%Y-%m-%d")
     bugun = datetime.now().strftime("%Y-%m-%d")
@@ -1173,22 +1414,24 @@ def finnhub_bist_cek() -> list:
             for item in r.json()[:2]:
                 b = item.get("headline","")
                 if b:
-                    h = yeni_h(f"Finnhub [{s}]", f"[{s}] {b}", item.get("url",""), "sirket")
+                    h              = yeni_h(f"Finnhub [{s}]", f"[{s}] {b}",
+                                            item.get("url",""), "sirket")
                     h["semboller"] = [s]
                     out.append(h)
             time.sleep(0.1)
-        except: pass
+        except:
+            pass
     return out
 
-def sirket_haberleri_cek() -> list:
+def sirket_haberleri_cek():
     out = []
     for ad, url, domain in [
         ("Foreks",       "https://www.foreks.com/haberler/sirket-haberleri/",  "www.foreks.com"),
-        ("BorsaGündem",  "https://www.borsagundem.com.tr/sirket-haberleri",    "www.borsagundem.com.tr"),
+        ("BorsaGundem",  "https://www.borsagundem.com.tr/sirket-haberleri",    "www.borsagundem.com.tr"),
         ("Investing TR", "https://tr.investing.com/news/company-news",          "tr.investing.com"),
     ]:
         try:
-            r = requests.get(url, timeout=12, headers=HEADERS)
+            r    = requests.get(url, timeout=12, headers=HEADERS)
             soup = BeautifulSoup(r.text, "html.parser")
             seen = set()
             for sel in ["h3 a","h2 a","h4 a",".news-title a","article a"]:
@@ -1203,170 +1446,191 @@ def sirket_haberleri_cek() -> list:
             log.warning(f"{ad}: {e}")
     return out
 
-# ════════════════════════════════════════════════
-# 🧠 CLAUDE ANALİZ
-# ════════════════════════════════════════════════
-def claude_skore_et(haberler: list, mod: str) -> list:
-    if not haberler: return []
+# ================================================================
+# CLAUDE ANALIZ
+# ================================================================
+def claude_skore_et(haberler, mod):
+    if not haberler:
+        return []
     try:
         client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
-        liste  = "\n".join([f"{i+1}. [{h['tier']}. Tier] {h['baslik']}"
-                            for i,h in enumerate(haberler)])
+        liste  = "\n".join([
+            f"{i+1}. [T{h['tier']}] {h['baslik']}"
+            for i, h in enumerate(haberler)
+        ])
 
         if mod == "global":
-            prompt = f"""Sen BIST/VİOP uzmanı Türk tradersin. Global haberleri BIST etkisi açısından skorla.
-Tier bilgisi: Tier1=TCMB/KAP/Reuters, Tier2=Bloomberg/AA, Tier3=medya
-
-PUANLAMA:
-9-10 = Piyasayı ANINDA etkiler: Fed acil, büyük savaş, Hürmüz kapanır, küresel kriz
-7-8  = Önemli: Fed/ECB sürpriz, petrol %3+, jeopolitik şok
-5-6  = Orta: Beklenen veri, bölgesel gerilim
-0-4  = Gürültü: Magazin, rutin haber
-
-Tier1 kaynak +1 puan, Tier3 kaynak -1 puan.
-
-SADECE JSON:
-[{{"id":1,"skor":9,"yon":"BEARISH","semboller":["TUPRS"],"ozet":"Türkçe max 12 kelime"}}]
-
-Haberler:
-{liste}"""
+            prompt = (
+                f"Sen BIST/VIOP uzmani Turk trader. Global haberleri BIST etkisi ile skorla.\n"
+                f"Tier: T1=resmi/Reuters, T2=Bloomberg/AA, T3=medya\n"
+                f"Petrol haberleri (OPEC/Hurmuz/Iran/EIA) otomatik +2 puan.\n\n"
+                f"PUANLAMA:\n"
+                f"9-10 = Piyasayi ANINDA etkiler: Fed acil, buyuk savas, Hurmuz kapanir\n"
+                f"7-8  = Onemli: Fed/ECB surpriz, petrol %3+, jeopolitik sok\n"
+                f"5-6  = Orta: Beklenen veri, bolgesel gerilim\n"
+                f"0-4  = Gurultu\n"
+                f"T1 kaynak +1, T3 kaynak -1.\n\n"
+                f"SADECE JSON:\n"
+                f'[{{"id":1,"skor":9,"yon":"BEARISH","semboller":["TUPRS"],"ozet":"max 12 kelime"}}]\n\n'
+                f"Haberler:\n{liste}"
+            )
         else:
-            prompt = f"""Sen BIST/VİOP uzmanı Türk tradersin. Türkiye haberlerini BIST etkisi açısından skorla.
-BIST30: {', '.join(BIST30)}
-[SEMBOL] ile başlayanlar = KAP/şirket haberi!
-Tier1 kaynak +1 puan, Tier3 kaynak -1 puan.
-
-PUANLAMA:
-9-10 = Acil: TCMB sürpriz faiz, TL kriz, yaptırım, deprem
-8    = Çok önemli: BIST30 KAP kararı, enflasyon/büyüme verisi, TCMB/SPK/BDDK kararı
-7    = Önemli: Orta şirket haberi, sektör kararı
-5-6  = Takip: Küçük şirket, genel ekonomi yorum
-0-4  = Gürültü: Siyaset, spor, magazin, belirsiz
-
-SADECE JSON:
-[{{"id":1,"skor":8,"yon":"BULLISH","semboller":["THYAO"],"ozet":"Türkçe max 12 kelime"}}]
-
-Haberler:
-{liste}"""
+            prompt = (
+                f"Sen BIST/VIOP uzmani Turk trader. Turkiye haberlerini BIST etkisi ile skorla.\n"
+                f"BIST30: {', '.join(BIST30)}\n"
+                f"[SEMBOL] ile baslayanlar = KAP/sirket haberi!\n"
+                f"Petrol haberleri (OPEC/Hurmuz/Iran/EIA) +2 puan.\n"
+                f"T1 kaynak +1, T3 kaynak -1.\n\n"
+                f"PUANLAMA:\n"
+                f"9-10 = Acil: TCMB surpriz faiz, TL kriz, yaptirim, deprem\n"
+                f"8    = Cok onemli: BIST30 KAP karari, enflasyon/buyume, TCMB/SPK/BDDK karari\n"
+                f"7    = Onemli: Orta sirket haberi, sektor karari\n"
+                f"5-6  = Takip: Kucuk sirket, genel ekonomi\n"
+                f"0-4  = Gurultu\n\n"
+                f"SADECE JSON:\n"
+                f'[{{"id":1,"skor":8,"yon":"BULLISH","semboller":["THYAO"],"ozet":"max 12 kelime"}}]\n\n'
+                f"Haberler:\n{liste}"
+            )
 
         msg  = client.messages.create(
             model="claude-sonnet-4-20250514", max_tokens=2500,
-            messages=[{"role":"user","content":prompt}]
+            messages=[{"role": "user", "content": prompt}]
         )
         text = msg.content[0].text.strip()
         if "```" in text:
-            m = re.search(r'\[.*\]', text, re.DOTALL)
+            m    = re.search(r'\[.*\]', text, re.DOTALL)
             text = m.group(0) if m else "[]"
         if not text.startswith("["):
-            m = re.search(r'\[.*\]', text, re.DOTALL)
+            m    = re.search(r'\[.*\]', text, re.DOTALL)
             text = m.group(0) if m else "[]"
 
         for s in json.loads(text):
-            idx = s.get("id",0) - 1
+            idx = s.get("id", 0) - 1
             if 0 <= idx < len(haberler):
-                mevcut = haberler[idx].get("semboller",[])
-                raw_skor = max(0, min(10, int(s.get("skor",0))))
-                # Tier ayarı
+                mevcut   = haberler[idx].get("semboller", [])
+                raw_skor = max(0, min(10, int(s.get("skor", 0))))
+                # Petrol haberi ise +2
+                if petrol_haberi_mi(haberler[idx].get("baslik","")):
+                    raw_skor = min(10, raw_skor + 2)
                 adj_skor = tier_skor_ayarla(raw_skor, haberler[idx].get("tier", 2))
                 haberler[idx].update({
                     "skor":      adj_skor,
-                    "yon":       s.get("yon","NÖTR"),
-                    "semboller": mevcut if mevcut else s.get("semboller",[]),
-                    "ozet":      s.get("ozet","")
+                    "yon":       s.get("yon", "NOTR"),
+                    "semboller": mevcut if mevcut else s.get("semboller", []),
+                    "ozet":      s.get("ozet", "")
                 })
     except Exception as e:
         log.warning(f"Claude ({mod}): {e}")
     return haberler
 
-# ════════════════════════════════════════════════
-# 💬 MESAJ FORMATI — 3 Stream
-# ════════════════════════════════════════════════
+# ================================================================
+# MESAJ FORMATI — 3 Stream
+# ================================================================
 KAYNAK_IKONLARI = {
-    "Reuters":"🔴","AP News":"🔴","BBC":"🟣","CNBC":"🟡","ZeroHedge":"🐻",
-    "FED":"🏦","ECB":"🏦","BIS":"🏦","IMF":"🏦","EIA":"⛽","OilPrice":"🛢️",
-    "ISW":"⚔️","Al Monitor":"🌙","IAEA":"☢️","NATO":"🛡️","ABD Dışişleri":"🦅",
-    "USGS":"🌍","TCMB":"🏛️","SPK":"🏛️","BDDK":"🏛️","Hazine":"🏛️","BTK":"🏛️",
-    "Rekabet":"⚖️","Borsa İstanbul":"📊","Resmi Gazete":"📜",
-    "AA":"📡","DHA":"📡","Bloomberg HT":"💹","Dünya":"💹","Para Analiz":"💹",
-    "Ekonomim":"💹","Marketaux":"📊","Finnhub":"📈","Foreks":"📈",
-    "BorsaGündem":"📈","Investing":"📈",
+    "Reuters":     "Rtr",
+    "AP News":     "AP",
+    "BBC":         "BBC",
+    "CNBC":        "CNBC",
+    "ZeroHedge":   "ZH",
+    "FED":         "FED",
+    "ECB":         "ECB",
+    "EIA":         "EIA",
+    "OilPrice":    "OIL",
+    "ISW":         "ISW",
+    "Al Monitor":  "AM",
+    "IAEA":        "IAEA",
+    "NATO":        "NATO",
+    "TCMB":        "TCMB",
+    "SPK":         "SPK",
+    "BDDK":        "BDDK",
+    "Hazine":      "HAZ",
+    "BTK":         "BTK",
+    "AA":          "AA",
+    "DHA":         "DHA",
+    "Bloomberg HT":"BHT",
+    "Dunya":       "DNYA",
+    "Marketaux":   "MKT",
+    "Finnhub":     "FNH",
+    "Foreks":      "FRK",
 }
 
 STREAM_HEADER = {
-    "MACRO":   "🏛️ <b>MACRO</b>",
-    "COMPANY": "🏢 <b>COMPANY</b>",
-    "GEO":     "🌍 <b>GEO / MARKET</b>",
-    "NEWS":    "📰 <b>NEWS</b>",
+    "MACRO":   "[MACRO]",
+    "COMPANY": "[COMPANY]",
+    "PETROL":  "[PETROL]",
+    "GEO":     "[GEO]",
+    "NEWS":    "[NEWS]",
 }
 
-def kaynak_ikon(kaynak: str) -> str:
+def kaynak_kisa(kaynak):
     for k, v in KAYNAK_IKONLARI.items():
-        if k.lower() in kaynak.lower(): return v
-    return "📌"
+        if k.lower() in kaynak.lower():
+            return v
+    return kaynak[:6].upper()
 
-def hash_h(t: str) -> str:
-    return hashlib.md5(t.encode("utf-8","ignore")).hexdigest()[:12]
+def hash_h(t):
+    return hashlib.md5(t.encode("utf-8", "ignore")).hexdigest()[:12]
 
-def mesaj_olustur(h: dict, mod: str, acil: bool = False) -> str:
+def mesaj_olustur(h, mod, acil=False):
     skor   = h.get("skor", 0)
-    yon    = h.get("yon","NÖTR")
-    syms   = h.get("semboller",[])
-    ozet   = h.get("ozet","")
-    nv     = h.get("novelty",1.0)
-    ml_s   = h.get("ml_skor",0.5)
-    sk_oz  = h.get("sektor_ozet","")
-    stream = h.get("stream","NEWS")
+    yon    = h.get("yon", "NOTR")
+    syms   = h.get("semboller", [])
+    ozet   = h.get("ozet", "")
+    nv     = h.get("novelty", 1.0)
+    ml_s   = h.get("ml_skor", 0.5)
+    sk_oz  = h.get("sektor_ozet", "")
+    stream = h.get("stream", "NEWS")
     tier   = h.get("tier", 2)
-    flag   = "🇹🇷" if mod=="turkey" else "🌍"
+    flag   = "TR" if mod == "turkey" else "GL"
 
     if acil or skor >= 9:
-        seviye, renk = "🚨 <b>ACİL ALARM</b>", "🔴"
+        seviye = "ACIL ALARM"
+        bar    = "🔴🔴🔴"
     elif skor >= 8:
-        seviye, renk = "⚡ <b>ÖNEMLİ</b>", "🟡"
+        seviye = "ONEMLI"
+        bar    = "🟡🟡"
     elif skor >= 7:
-        seviye, renk = "🔵 <b>TAKİP</b>", "🔵"
+        seviye = "TAKİP"
+        bar    = "🔵"
     else:
-        seviye, renk = "⚪ <b>BİLGİ</b>", "⚪"
+        seviye = "BILGI"
+        bar    = "⚪"
 
-    yon_str    = {"BULLISH":"📈 BULLISH","BEARISH":"📉 BEARISH",
-                  "NÖTR":"➡️ NÖTR","MIXED":"↔️ MIXED"}.get(yon, yon)
-    nb         = "🆕" if nv>=0.9 else ("🔄" if nv>=0.5 else "♻️")
-    tier_badge = {1:"🏆T1", 2:"", 3:"📰T3"}.get(tier, "")
-    ki         = kaynak_ikon(h["kaynak"])
-    ss         = "  ".join([f"<code>#{s}</code>" for s in syms[:5]])
+    yon_str    = {"BULLISH":"yukselis","BEARISH":"dusus",
+                  "NOTR":"yatay","MIXED":"karisik"}.get(yon, yon)
+    nb         = "YENİ" if nv >= 0.9 else ("GUNCELLENDI" if nv >= 0.5 else "TEKRAR")
+    tier_badge = " [T1]" if tier == 1 else (" [T3]" if tier == 3 else "")
+    kk         = kaynak_kisa(h["kaynak"])
+    ss         = "  ".join([f"<code>{s}</code>" for s in syms[:5]])
+    st_label   = STREAM_HEADER.get(stream, "[NEWS]")
 
     ml_line = ""
     if ml.trained and ml_s >= 0.7:
-        ml_line = f"\n🤖 <b>ML: %{int(ml_s*100)} hareket ihtimali</b>"
+        ml_line = f"\nML: %{int(ml_s*100)} hareket ihtimali"
     elif ml.trained and ml_s >= 0.5:
-        ml_line = f"\n🤖 ML: %{int(ml_s*100)}"
-
-    stream_label = STREAM_HEADER.get(stream, "📰 <b>NEWS</b>")
+        ml_line = f"\nML: %{int(ml_s*100)}"
 
     msg  = f"━━━━━━━━━━━━━━━━━━━━━━\n"
-    msg += f"{renk}{flag} {seviye}  <b>[{skor}/10]</b>  {nb}  {stream_label}\n"
+    msg += f"{bar} <b>{seviye}</b>  [{skor}/10]  {st_label}  [{flag}]  {nb}\n"
     msg += f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
-    msg += f"{ki} <b>{h['kaynak']}</b> {tier_badge}  ·  ⏰ <code>{h['zaman']}</code>\n\n"
-    msg += f"📰 {h['baslik']}\n"
+    msg += f"<b>{kk}{tier_badge}</b>  ·  <code>{h['zaman']}</code>\n\n"
+    msg += f"<b>{h['baslik']}</b>\n"
     if ozet:
-        msg += f"\n{yon_str}\n💬 {ozet}\n"
+        msg += f"\n{yon_str.upper()}  —  {ozet}\n"
     if sk_oz:
-        msg += f"🏭 {sk_oz}\n"
+        msg += f"{sk_oz}\n"
     if ml_line:
         msg += ml_line + "\n"
     if ss:
-        msg += f"\n🎯 {ss}\n"
+        msg += f"\n{ss}\n"
     if h.get("url"):
-        msg += f"\n🔗 <a href='{h['url']}'>Habere Git →</a>"
+        msg += f"\n<a href='{h['url']}'>Habere Git</a>"
     return msg
 
-# ════════════════════════════════════════════════
-# 🌅 SABAH BRİFİNG + 📊 AKŞAM ÖZETİ
-# ════════════════════════════════════════════════
-son_sabah_brifing: str | None = None
-son_aksam_ozeti:   str | None = None
-
-async def sabah_brifing(bot: Bot):
+# ================================================================
+# SABAH BRIFING + AKSAM OZETI
+# ================================================================
+async def sabah_brifing(bot):
     try:
         client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
         sinir  = (datetime.now() - timedelta(hours=12)).isoformat()
@@ -1378,41 +1642,46 @@ async def sabah_brifing(bot: Bot):
         """, (sinir,)).fetchall()
         con.close()
 
-        # Bugünün macro takvimi (Finnhub)
-        bugun = datetime.now().strftime("%Y-%m-%d")
-        takvim_str = "Bugün önemli veri yok"
+        bugun        = datetime.now().strftime("%Y-%m-%d")
+        takvim_str   = "Bugün onemli veri yok"
         try:
             r = requests.get(
                 "https://finnhub.io/api/v1/calendar/economic",
-                params={"from":bugun,"to":bugun,"token":FINNHUB_KEY}, timeout=8
+                params={"from": bugun, "to": bugun, "token": FINNHUB_KEY},
+                timeout=8
             ).json()
-            events = [
-                f"• {ev['time'][11:16]} — {ev['event']} [{ev.get('country','')}]"
-                for ev in r.get("economicCalendar",[])
+            evs = [
+                f"- {ev['time'][11:16]} {ev['event']} [{ev.get('country','')}]"
+                for ev in r.get("economicCalendar", [])
                 if ev.get("impact") in ["high","medium"]
                 and ev.get("country") in ["TR","US"]
             ]
-            if events: takvim_str = "\n".join(events[:8])
-        except: pass
+            if evs:
+                takvim_str = "\n".join(evs[:8])
+        except:
+            pass
 
-        gece_listesi = "\n".join([f"• [{r[1]}/10] [{r[4]}] {r[0]}" for r in rows[:10]]) \
-                       or "Gece sakin geçti."
+        gece_listesi = "\n".join([
+            f"- [{r[1]}/10] [{r[4]}] {r[0]}"
+            for r in rows[:10]
+        ]) or "Gece sakin gecti."
 
-        prompt = f"""Sen BIST/VİOP uzmanı Türk trader asistanısın. Sabah 09:45 brifingini yaz.
-Kısa, net, aksiyon odaklı. Türkçe. Max 20 satır.
+        # Brent anlık
+        brent_fiyat = brent_radar._brent_fiyat_cek()
+        brent_str   = f"Brent: {brent_fiyat:.2f}" if brent_fiyat else ""
 
-GECE HABERLERİ (önem sırasıyla):
-{gece_listesi}
-
-BUGÜN TAKVİM:
-{takvim_str}
-
-Yaz:
-🌍 GECE NE OLDU — 3-4 madde, her birinde hisse ticker
-📅 BUGÜN TAKVİM — saatlerle birlikte
-👁 GÖZETLEME — bugün dikkat edilecek 3 hisse + neden
-💡 GENEL YORUM — tek cümle piyasa tonu"""
-
+        prompt = (
+            f"Sen BIST/VIOP uzmani Turk trader asistanisin. "
+            f"Sabah 09:45 brifingini yaz. Kisa, net, aksiyon odakli. Turkce. Max 20 satir.\n\n"
+            f"GECE HABERLERI:\n{gece_listesi}\n\n"
+            f"BUGUN TAKVIM:\n{takvim_str}\n\n"
+            f"BRENT: {brent_str}\n\n"
+            f"Yaz:\n"
+            f"GECE NE OLDU — 3-4 madde, her birinde hisse ticker\n"
+            f"BUGUN TAKVIM — saatlerle\n"
+            f"GOZETLEME — bugun dikkat edilecek 3 hisse + neden\n"
+            f"GENEL YORUM — tek cumle piyasa tonu"
+        )
         msg = client.messages.create(
             model="claude-sonnet-4-20250514", max_tokens=800,
             messages=[{"role":"user","content":prompt}]
@@ -1421,17 +1690,17 @@ Yaz:
             chat_id=CHAT_ID,
             text=(
                 f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"🌅 <b>SABAH BRİFİNG</b> — {datetime.now().strftime('%d.%m.%Y')}\n"
+                f"🌅 <b>SABAH BRIFING</b>  —  {datetime.now().strftime('%d.%m.%Y')}\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
                 f"{msg.content[0].text.strip()}"
             ),
             parse_mode=ParseMode.HTML
         )
-        log.info("🌅 Sabah brifing gönderildi")
+        log.info("Sabah brifing gonderildi")
     except Exception as e:
         log.warning(f"sabah_brifing: {e}")
 
-async def aksam_ozeti(bot: Bot):
+async def aksam_ozeti(bot):
     try:
         client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
         sinir  = datetime.now().replace(hour=8, minute=0, second=0).isoformat()
@@ -1447,7 +1716,6 @@ async def aksam_ozeti(bot: Bot):
             FROM haberler WHERE gonderildi=1 AND relative_move IS NOT NULL
             AND timestamp >= ?
         """, (sinir,)).fetchone()
-        # Feedback istatistikleri
         fb_rows = con.execute("""
             SELECT feedback, COUNT(*) FROM haberler
             WHERE feedback IS NOT NULL AND timestamp >= ?
@@ -1460,35 +1728,42 @@ async def aksam_ozeti(bot: Bot):
         takip_s  = sum(1 for r in rows if 7 <= r[1] < 8)
         ml_t     = ml_r[0] or 0
         ml_d     = ml_r[1] or 0
-        ml_oran  = f"%{int(ml_d/ml_t*100)}" if ml_t > 0 else "—"
-        fb_str   = "  ".join([f"{k}:{v}" for k,v in fb_rows]) or "—"
+        ml_oran  = f"%{int(ml_d/ml_t*100)}" if ml_t > 0 else "yeterli veri yok"
+        fb_str   = "  ".join([f"{k}:{v}" for k, v in fb_rows]) or "—"
 
         hisse_c = defaultdict(int)
         for r in rows:
-            for s in json.loads(r[3] or "[]"): hisse_c[s] += 1
-        top_h    = sorted(hisse_c.items(), key=lambda x:x[1], reverse=True)[:5]
-        hisse_str= "  ".join([f"<code>{s}</code>({n})" for s,n in top_h]) or "—"
-        top5     = "\n".join([f"• [{r[1]}/10] [{r[4]}] {r[0][:70]}" for r in rows[:5]]) or "—"
+            for s in json.loads(r[3] or "[]"):
+                hisse_c[s] += 1
+        top_h     = sorted(hisse_c.items(), key=lambda x: x[1], reverse=True)[:5]
+        hisse_str = "  ".join([f"<code>{s}</code>({n})" for s, n in top_h]) or "—"
+        top5      = "\n".join([
+            f"- [{r[1]}/10] [{r[4]}] {r[0][:70]}" for r in rows[:5]
+        ]) or "—"
 
-        # Yarının takvimi
-        yarin = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+        yarin        = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
         yarin_takvim = "—"
         try:
             r2 = requests.get(
                 "https://finnhub.io/api/v1/calendar/economic",
-                params={"from":yarin,"to":yarin,"token":FINNHUB_KEY}, timeout=8
+                params={"from":yarin,"to":yarin,"token":FINNHUB_KEY},
+                timeout=8
             ).json()
-            evs = [f"• {e['time'][11:16]} {e['event']}"
-                   for e in r2.get("economicCalendar",[])
-                   if e.get("impact")=="high" and e.get("country") in ["TR","US"]]
-            if evs: yarin_takvim = "\n".join(evs[:5])
-        except: pass
+            evs = [
+                f"- {e['time'][11:16]} {e['event']}"
+                for e in r2.get("economicCalendar",[])
+                if e.get("impact") == "high" and e.get("country") in ["TR","US"]
+            ]
+            if evs:
+                yarin_takvim = "\n".join(evs[:5])
+        except:
+            pass
 
-        prompt = f"""Sen BIST/VİOP uzmanı. Kısa akşam özeti yaz. Türkçe. Max 12 satır.
-EN ÖNEMLİ HABERLER:
-{top5}
-Yaz: genel değerlendirme (1 cümle), en kritik haber ve etkisi, yarın dikkat edilecek konu."""
-
+        prompt = (
+            f"Sen BIST/VIOP uzmani. Aksam ozeti yaz. Turkce. Max 12 satir.\n"
+            f"EN ONEMLI HABERLER:\n{top5}\n"
+            f"Yaz: genel degerlendirme, en kritik haber, yarin dikkat."
+        )
         msg = client.messages.create(
             model="claude-sonnet-4-20250514", max_tokens=500,
             messages=[{"role":"user","content":prompt}]
@@ -1497,52 +1772,54 @@ Yaz: genel değerlendirme (1 cümle), en kritik haber ve etkisi, yarın dikkat e
             chat_id=CHAT_ID,
             text=(
                 f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"📊 <b>GÜNÜN ÖZETİ</b> — {datetime.now().strftime('%d.%m.%Y')}\n"
+                f"📊 <b>GUNUN OZETI</b>  —  {datetime.now().strftime('%d.%m.%Y')}\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"📨 Bugün: <b>{len(rows)} haber</b>  🔴{acil_s}  🟡{onemli_s}  🔵{takip_s}\n"
-                f"🎯 En çok: {hisse_str}\n"
-                f"🤖 ML doğruluk: {ml_oran} ({ml_t} ölçüm)\n"
-                f"📋 Feedback: {fb_str}\n\n"
+                f"Bugün: <b>{len(rows)} haber</b>  "
+                f"Acil:{acil_s}  Onemli:{onemli_s}  Takip:{takip_s}\n"
+                f"En cok: {hisse_str}\n"
+                f"ML dogruluk: {ml_oran} ({ml_t} olcum)\n"
+                f"Feedback: {fb_str}\n\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"{msg.content[0].text.strip()}\n\n"
-                f"📅 <b>Yarın:</b>\n{yarin_takvim}"
+                f"<b>Yarin:</b>\n{yarin_takvim}"
             ),
             parse_mode=ParseMode.HTML
         )
-        log.info("📊 Akşam özeti gönderildi")
+        log.info("Aksam ozeti gonderildi")
     except Exception as e:
         log.warning(f"aksam_ozeti: {e}")
 
-# ════════════════════════════════════════════════
-# 🔄 ANA DÖNGÜ
-# ════════════════════════════════════════════════
-bekl_global:       list = []
-bekl_turkey:       list = []
-son_ai:            float = 0.0
-son_fiyat:         float = 0.0
-son_macro:         float = 0.0
-son_ml_guncelle:   float = 0.0
-son_feedback:      float = 0.0
-son_durum:         datetime = datetime.now()
-son_sabah_brifing: str | None = None
-son_aksam_ozeti:   str | None = None
-dongu_sayac:       int = 0
-toplam_gonderilen: int = 0
-baslangic:         datetime = datetime.now()
-telegram_kuyruk:   list = []
+# ================================================================
+# ANA DONGU
+# ================================================================
+bekl_global         = []
+bekl_turkey         = []
+son_ai              = 0.0
+son_brent_fiyat     = 0.0
+son_brent_teknik    = 0.0
+son_macro           = 0.0
+son_ml_guncelle     = 0.0
+son_feedback        = 0.0
+son_durum           = datetime.now()
+son_sabah_brifing   = None
+son_aksam_ozeti     = None
+dongu_sayac         = 0
+toplam_gonderilen   = 0
+baslangic           = datetime.now()
+telegram_kuyruk     = []
 
 async def ana_dongu():
-    global bekl_global, bekl_turkey, son_ai, son_fiyat, son_macro
-    global son_ml_guncelle, son_feedback, son_durum, dongu_sayac
-    global toplam_gonderilen, telegram_kuyruk
+    global bekl_global, bekl_turkey, son_ai
+    global son_brent_fiyat, son_brent_teknik, son_macro
+    global son_ml_guncelle, son_feedback, son_durum
+    global dongu_sayac, toplam_gonderilen, telegram_kuyruk
     global son_sabah_brifing, son_aksam_ozeti
 
     db_init()
-    dedup_yukle()  # ← Kalıcı dedup yükle
-    bot = Bot(token=TELEGRAM_TOKEN)
+    dedup_yukle()
+    bot            = Bot(token=TELEGRAM_TOKEN)
     telethon_aktif = False
 
-    # ── Telethon ──────────────────────────────
     if TELETHON_SESSION and TELEGRAM_KANALLARI:
         try:
             tg = TelegramClient(
@@ -1550,16 +1827,15 @@ async def ana_dongu():
             )
             await tg.start()
             telethon_aktif = True
-            log.info(f"✅ Telethon: {len(TELEGRAM_KANALLARI)} kanal")
 
             @tg.on(tg_events.NewMessage(chats=TELEGRAM_KANALLARI))
             async def tg_handler(event):
                 m = event.raw_text
                 if m and len(m) > 15:
                     um = re.search(r'https?://\S+', m)
-                    b  = m[:260].replace("\n"," ").strip()
+                    b  = m[:260].replace("\n", " ").strip()
                     h  = yeni_h(
-                        f"📲 {getattr(event.chat,'title','Telegram')}",
+                        f"TG:{getattr(event.chat,'title','Telegram')}",
                         b, um.group(0) if um else "", "telegram"
                     )
                     h["semboller"] = nov.entity_bul(b)
@@ -1567,87 +1843,83 @@ async def ana_dongu():
         except Exception as e:
             log.warning(f"Telethon: {e}")
 
-    # ── Başlangıç mesajı ──────────────────────
     await bot.send_message(
         chat_id=CHAT_ID,
         text=(
             "━━━━━━━━━━━━━━━━━━━━━━\n"
-            "🤖 <b>BERKAY TERMINATOR v3.1</b>\n"
-            f"🗓 {datetime.now().strftime('%d.%m.%Y %H:%M')}\n"
+            "<b>BERKAY TERMINATOR v3.1</b>\n"
+            f"{datetime.now().strftime('%d.%m.%Y %H:%M')}\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            "<b>SİSTEMLER:</b>\n"
-            f"{'✅' if telethon_aktif else '⚪'} Telethon\n"
-            "✅ Kalıcı Dedup (SQLite)\n"
-            "✅ Source Tiering (T1/T2/T3)\n"
-            "✅ Event ID Dedup (20dk)\n"
-            "✅ Macro Engine (30dk+Veri+5dk)\n"
-            "✅ Feedback Butonları\n"
-            "✅ 3-Stream (MACRO/COMPANY/GEO)\n"
-            "✅ Multi-Horizon ML (5m/15m/60m)\n"
-            "✅ Fiyat Radar · Momentum Radar\n"
-            "✅ Sabah/Akşam Rapor\n\n"
-            f"🌍 {len(RSS_GLOBAL)} global  |  🇹🇷 {len(RSS_TURKEY)} TR RSS\n\n"
-            "🔴 ACİL [9-10]  🟡 ÖNEMLİ [8]  🔵 TAKİP [7]\n"
+            "SISTEMLER:\n"
+            f"{'Aktif' if telethon_aktif else 'Pasif'} Telethon\n"
+            "Aktif: Kalici Dedup\n"
+            "Aktif: Source Tiering T1/T2/T3\n"
+            "Aktif: Event ID Dedup (20dk)\n"
+            "Aktif: Macro Engine (30dk+Veri+5dk tepki)\n"
+            "Aktif: Feedback Butonlari\n"
+            "Aktif: Brent Radar (%0.5 sari / %1.0 kirmizi)\n"
+            "Aktif: Brent Teknik (her 30dk)\n"
+            "Aktif: Multi-Horizon ML (5m/15m/60m)\n"
+            "Aktif: Momentum Radar\n"
+            "Aktif: Sabah/Aksam Rapor\n\n"
+            f"Global RSS: {len(RSS_GLOBAL)}  |  TR RSS: {len(RSS_TURKEY)}\n\n"
+            "ACIL[9-10]  ONEMLI[8]  TAKIP[7]\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n"
-            "📡 İzleme başladı..."
+            "Izleme basladi..."
         ),
         parse_mode=ParseMode.HTML
     )
-    log.info("✅ TERMINATOR v3.1 BAŞLADI!")
+    log.info("TERMINATOR v3.1 BASLADI!")
 
-    # ── Ana döngü ─────────────────────────────
     while True:
         try:
             now   = time.time()
             simdi = datetime.now()
             dongu_sayac += 1
 
-            # Haber çek
             g_raw = rss_cek(RSS_GLOBAL) + finnhub_genel_cek()
             t_raw = rss_cek(RSS_TURKEY) + marketaux_cek()
 
-            # Her 4 döngüde şirket haberleri
             if dongu_sayac % 4 == 0:
-                sirket = sirket_haberleri_cek() + finnhub_bist_cek()
-                t_raw += sirket
-                if sirket: log.info(f"📈 {len(sirket)} şirket haberi")
+                sirket  = sirket_haberleri_cek() + finnhub_bist_cek()
+                t_raw  += sirket
+                if sirket:
+                    log.info(f"{len(sirket)} sirket haberi")
 
-            # Telegram kuyruğu
             if telegram_kuyruk:
                 t_raw += telegram_kuyruk[:30]
                 telegram_kuyruk.clear()
 
-            acil_kuyruk: list = []
+            acil_kuyruk = []
 
-            def isle(haberler: list, kuyruk: list, mod: str):
+            def isle(haberler, kuyruk, mod):
                 for h in haberler:
                     hsh = hash_h(h["baslik"])
-                    if hsh in gonderilen or not h["baslik"] or len(h["baslik"]) < 10:
+                    if (hsh in gonderilen or
+                            not h["baslik"] or
+                            len(h["baslik"]) < 10):
                         continue
-                    # Event ID dedup (aynı olay 20dk içinde)
                     if event_tekrar_mi(h["baslik"]):
                         continue
                     gonderilen.add(hsh)
-                    dedup_kaydet(hsh)  # ← Kalıcı kaydet
-                    # Sektör matrisi
+                    dedup_kaydet(hsh)
+                    # Sektor matrisi
                     sm_syms, sm_yon, sm_oz = sektor_analiz(h["baslik"])
                     if not h["semboller"]:
                         h["semboller"] = nov.entity_bul(h["baslik"])
                     for s in sm_syms:
-                        if s not in h["semboller"]: h["semboller"].append(s)
+                        if s not in h["semboller"]:
+                            h["semboller"].append(s)
                     h["semboller"] = h["semboller"][:5]
-                    if sm_oz: h["sektor_ozet"] = sm_oz
-                    if sm_yon != "NÖTR" and h["yon"] == "NÖTR": h["yon"] = sm_yon
-                    # Stream
-                    h["stream"] = stream_belirle(h)
-                    # Novelty
-                    ek = h["semboller"][0] if h["semboller"] else "GENEL"
+                    if sm_oz:
+                        h["sektor_ozet"] = sm_oz
+                    if sm_yon != "NOTR" and h["yon"] == "NOTR":
+                        h["yon"] = sm_yon
+                    h["stream"]  = stream_belirle(h)
+                    ek           = h["semboller"][0] if h["semboller"] else "GENEL"
                     h["novelty"] = nov.skorla(ek, h["baslik"])
-                    # ML skor
                     h["ml_skor"] = ml.skor(h)
-                    # Momentum
                     momentum.ekle(h["baslik"])
-                    # ACİL?
                     if acil_mi(h["baslik"], mod):
                         h["skor"] = 9
                         acil_kuyruk.append((h, mod))
@@ -1657,87 +1929,107 @@ async def ana_dongu():
             isle(g_raw, bekl_global, "global")
             isle(t_raw, bekl_turkey, "turkey")
 
-            # ACİL — hemen gönder
+            # ACİL — hemen gonder
             if acil_kuyruk:
-                log.info(f"🚨 {len(acil_kuyruk)} ACİL!")
+                log.info(f"ACIL: {len(acil_kuyruk)} haber")
                 for h, mod in acil_kuyruk:
                     try:
-                        haber_id = db_kaydet(h, mod, gonderildi=1)
-                        sent_msg = await bot.send_message(
+                        haber_id = db_kaydet(h, mod, gonderildi_flag=1)
+                        sent     = await bot.send_message(
                             chat_id=CHAT_ID,
                             text=mesaj_olustur(h, mod, acil=True),
                             parse_mode=ParseMode.HTML,
                             disable_web_page_preview=True,
                             reply_markup=feedback_keyboard(haber_id)
                         )
-                        db_msg_id_guncelle(haber_id, sent_msg.message_id)
+                        db_msg_id_guncelle(haber_id, sent.message_id)
                         toplam_gonderilen += 1
                         await asyncio.sleep(1)
                     except Exception as ex:
-                        log.error(f"Acil gönderme: {ex}")
+                        log.error(f"Acil gonderme: {ex}")
 
             toplam = len(bekl_global) + len(bekl_turkey)
             if toplam > 0:
-                log.info(f"📥 Kuyruk: 🌍{len(bekl_global)} | 🇹🇷{len(bekl_turkey)}")
+                log.info(f"Kuyruk: GL{len(bekl_global)} | TR{len(bekl_turkey)}")
 
             # AI skorlama
             yeterli = len(bekl_global) >= 5 or len(bekl_turkey) >= 5
             if toplam > 0 and (yeterli or (now - son_ai) >= AI_INTERVAL):
-                son_ai = now
-                gonderilenler: list = []
+                son_ai       = now
+                gonderilenler = []
 
                 if bekl_global:
                     sk = claude_skore_et(bekl_global[:20], "global")
                     for h in sk:
-                        h["fs"] = h.get("skor",0) * h.get("novelty",1.0) * (1 + h.get("ml_skor",0.5))
-                    gonderilenler += [(h,"global") for h in
-                        sorted([h for h in sk if h.get("skor",0)>=GLOBAL_THRESH],
-                               key=lambda x:x["fs"], reverse=True)[:MAX_GLOBAL]]
+                        h["fs"] = (h.get("skor",0) *
+                                   h.get("novelty",1.0) *
+                                   (1 + h.get("ml_skor",0.5)))
+                    gonderilenler += [
+                        (h, "global") for h in
+                        sorted(
+                            [h for h in sk if h.get("skor",0) >= GLOBAL_THRESH],
+                            key=lambda x: x["fs"], reverse=True
+                        )[:MAX_GLOBAL]
+                    ]
                     bekl_global = []
 
                 if bekl_turkey:
                     sk = claude_skore_et(bekl_turkey[:25], "turkey")
                     for h in sk:
-                        h["fs"] = h.get("skor",0) * h.get("novelty",1.0) * (1 + h.get("ml_skor",0.5))
-                    gonderilenler += [(h,"turkey") for h in
-                        sorted([h for h in sk if h.get("skor",0)>=TURKEY_THRESH],
-                               key=lambda x:x["fs"], reverse=True)[:MAX_TURKEY]]
+                        h["fs"] = (h.get("skor",0) *
+                                   h.get("novelty",1.0) *
+                                   (1 + h.get("ml_skor",0.5)))
+                    gonderilenler += [
+                        (h, "turkey") for h in
+                        sorted(
+                            [h for h in sk if h.get("skor",0) >= TURKEY_THRESH],
+                            key=lambda x: x["fs"], reverse=True
+                        )[:MAX_TURKEY]
+                    ]
                     bekl_turkey = []
 
                 gonderilenler.sort(key=lambda x: x[0].get("fs",0), reverse=True)
 
                 if gonderilenler:
-                    log.info(f"✅ {len(gonderilenler)} haber")
+                    log.info(f"Gonderiliyor: {len(gonderilenler)} haber")
                     for h, mod in gonderilenler:
                         try:
-                            haber_id = db_kaydet(h, mod, gonderildi=1)
-                            sent_msg = await bot.send_message(
+                            haber_id = db_kaydet(h, mod, gonderildi_flag=1)
+                            sent     = await bot.send_message(
                                 chat_id=CHAT_ID,
                                 text=mesaj_olustur(h, mod),
                                 parse_mode=ParseMode.HTML,
                                 disable_web_page_preview=True,
                                 reply_markup=feedback_keyboard(haber_id)
                             )
-                            db_msg_id_guncelle(haber_id, sent_msg.message_id)
+                            db_msg_id_guncelle(haber_id, sent.message_id)
                             toplam_gonderilen += 1
-                            log.info(f"[{h['skor']}][{h.get('stream','?')}] {h['baslik'][:65]}")
+                            log.info(
+                                f"[{h['skor']}][{h.get('stream','?')}] "
+                                f"{h['baslik'][:65]}"
+                            )
                             await asyncio.sleep(1.5)
                         except Exception as ex:
-                            log.error(f"Gönderme: {ex}")
+                            log.error(f"Gonderme: {ex}")
                 else:
-                    log.info("— Eşik yok")
+                    log.info("Esik yok")
 
-            # Fiyat radar (her 5 dk)
-            if (now - son_fiyat) >= PRICE_INTERVAL:
-                son_fiyat = now
-                await fiyat_radar.kontrol(bot)
+            # Brent fiyat kontrolu (her 2 dk)
+            if (now - son_brent_fiyat) >= PRICE_INTERVAL:
+                son_brent_fiyat = now
+                await brent_radar.fiyat_kontrol(bot)
+
+            # Brent teknik (her 30 dk)
+            if (now - son_brent_teknik) >= BRENT_TEKNIK_INTERVAL:
+                son_brent_teknik = now
+                await brent_radar.teknik_gonder(bot)
 
             # Macro engine (her 60 sn)
             if (now - son_macro) >= MACRO_INTERVAL:
                 son_macro = now
                 await macro_engine.kontrol(bot)
 
-            # Momentum alarmları
+            # Momentum alarmlar
             for kume_adi, n, son_h in momentum.kontrol():
                 try:
                     await bot.send_message(
@@ -1745,20 +2037,21 @@ async def ana_dongu():
                         text=momentum.alarm_mesaj(kume_adi, n, son_h),
                         parse_mode=ParseMode.HTML
                     )
-                    log.info(f"⚡ Momentum: {kume_adi} ({n})")
+                    log.info(f"Momentum: {kume_adi} ({n})")
                 except Exception as ex:
                     log.error(f"Momentum: {ex}")
 
-            # Feedback kontrolü (her 60 sn)
+            # Feedback kontrolu (her 60 sn)
             if (now - son_feedback) >= FEEDBACK_INTERVAL:
                 son_feedback = now
                 await feedback_kontrol(bot)
 
-            # ML veri güncelle (her 20 dk)
+            # ML veri guncelle (her 20 dk)
             if (now - son_ml_guncelle) >= 1200:
                 son_ml_guncelle = now
                 ml.fiyat_guncelle([("move_5m",5), ("move_15m",15), ("move_60m",60)])
-                if ml.son_egitim is None or (simdi-ml.son_egitim).days >= 7:
+                if (ml.son_egitim is None or
+                        (simdi - ml.son_egitim).days >= 7):
                     await asyncio.get_event_loop().run_in_executor(None, ml.egit)
 
             # Sabah brifing (09:45)
@@ -1768,7 +2061,7 @@ async def ana_dongu():
                     son_sabah_brifing = bugun_str
                     await sabah_brifing(bot)
 
-            # Akşam özeti (17:45)
+            # Aksam ozeti (17:45)
             if simdi.hour == 17 and simdi.minute == 45:
                 bugun_str = simdi.strftime("%Y%m%d")
                 if son_aksam_ozeti != bugun_str:
@@ -1780,7 +2073,9 @@ async def ana_dongu():
                 son_durum = simdi
                 try:
                     con  = sqlite3.connect(DB_PATH)
-                    tk   = con.execute("SELECT COUNT(*) FROM haberler").fetchone()[0]
+                    tk   = con.execute(
+                        "SELECT COUNT(*) FROM haberler"
+                    ).fetchone()[0]
                     ml_v = con.execute(
                         "SELECT COUNT(*) FROM haberler WHERE relative_move IS NOT NULL"
                     ).fetchone()[0]
@@ -1788,20 +2083,26 @@ async def ana_dongu():
                         "SELECT COUNT(*) FROM haberler WHERE feedback IS NOT NULL"
                     ).fetchone()[0]
                     con.close()
-                except: tk, ml_v, fb_c = 0, 0, 0
+                except:
+                    tk, ml_v, fb_c = 0, 0, 0
+
+                brent_su_an = brent_radar._brent_fiyat_cek()
+                brent_str   = f"Brent: {brent_su_an:.2f}" if brent_su_an else "Brent: —"
+
                 await bot.send_message(
                     chat_id=CHAT_ID,
                     text=(
                         f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                        f"📊 <b>SİSTEM RAPORU</b>\n"
+                        f"📊 <b>SISTEM RAPORU</b>\n"
                         f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                        f"⏱ Çalışma: {int((simdi-baslangic).total_seconds()//3600)} saat\n"
-                        f"📨 Gönderilen: {toplam_gonderilen} haber\n"
-                        f"🗄 DB kayıt: {tk}\n"
-                        f"🤖 ML verisi: {ml_v}/{ml.MIN_VERI}\n"
-                        f"🤖 ML aktif: {'✅' if ml.trained else '⏳ Birikim devam'}\n"
-                        f"📋 Feedback: {fb_c} etiket\n"
-                        f"⏰ {simdi.strftime('%d.%m.%Y %H:%M')}"
+                        f"Calisma: {int((simdi-baslangic).total_seconds()//3600)} saat\n"
+                        f"Gonderilen: {toplam_gonderilen} haber\n"
+                        f"DB kayit: {tk}\n"
+                        f"ML verisi: {ml_v}/{ml.MIN_VERI}\n"
+                        f"ML aktif: {'Evet' if ml.trained else 'Birikim devam'}\n"
+                        f"Feedback: {fb_c} etiket\n"
+                        f"{brent_str}\n"
+                        f"{simdi.strftime('%d.%m.%Y %H:%M')}"
                     ),
                     parse_mode=ParseMode.HTML
                 )
@@ -1809,12 +2110,13 @@ async def ana_dongu():
             # Hash temizle
             if len(gonderilen) > 10000:
                 gonderilen.clear()
-                log.info("🧹 Hash seti temizlendi")
+                log.info("Hash seti temizlendi")
 
         except Exception as e:
-            log.error(f"Döngü hatası: {e}")
+            log.error(f"Dongu hatasi: {e}")
             await asyncio.sleep(30)
 
         await asyncio.sleep(POLL_INTERVAL)
+
 
 asyncio.run(ana_dongu())
