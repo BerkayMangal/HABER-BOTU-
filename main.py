@@ -1366,8 +1366,7 @@ def rss_cek(feeds):
             continue
     out.append(yeni_h(kaynak, b, e.get("link", "")))
         except Exception as e:
-            log.debug(f"RSS {kaynak}: {e}")
-    return out
+            log.debug(f"RSS {kaynak}: {e}")    return out
 
 def marketaux_cek():
     out = []
