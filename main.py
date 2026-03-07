@@ -1354,7 +1354,7 @@ def rss_cek(feeds):
     for kaynak, url in feeds:
         try:
             feed = feedparser.parse(url, request_headers=HEADERS)
-            for e in feed.entries[:6]:
+for e in feed.entries[:6]:
     b = (e.get("title") or "").strip()
     if not b or len(b) <= 10:
         continue
