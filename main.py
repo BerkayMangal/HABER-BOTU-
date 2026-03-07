@@ -80,7 +80,7 @@ NOVELTY_HOURS     = 24
 PRICE_INTERVAL    = 120   # Brent fiyat kontrolu her 2 dk
 MACRO_INTERVAL    = 60
 FEEDBACK_INTERVAL = 60
-BRENT_TEKNIK_INTERVAL = 21600  # 6 saat
+BRENT_TEKNIK_INTERVAL = 1800  # 30 dk
 
 TELEGRAM_KANALLARI = []
 
@@ -959,7 +959,7 @@ class MacroEngine:
                 await self._send_pre(bot, ev_time, event_name, country, impact,
                                      forecast, previous)
 
-        elif diff_min < 30 and actual is not None and str(actual).strip() not in ("", "0"):
+        elif diff_min < 5 and actual is not None and str(actual).strip() not in ("", "0"):
             key = f"release_{ev_key}"
             if key not in self.sent_release:
                 self.sent_release.add(key)
@@ -1270,53 +1270,56 @@ nov = NoveltyMemory()
 # RSS KAYNAKLARI
 # ================================================================
 RSS_GLOBAL = [
+    # Tier 1 — Haber ajansları (en hızlı, en güvenilir)
     ("Reuters",         "https://feeds.reuters.com/reuters/topNews"),
     ("Reuters Biz",     "https://feeds.reuters.com/reuters/businessNews"),
     ("Reuters EM",      "https://feeds.reuters.com/reuters/emergingMarketsNews"),
-    ("Reuters Dunya",   "https://feeds.reuters.com/reuters/worldNews"),
     ("AP News",         "https://rsshub.app/apnews/topics/ap-top-news"),
-    ("BBC Dunya",       "https://feeds.bbci.co.uk/news/world/rss.xml"),
-    ("BBC Ekonomi",     "https://feeds.bbci.co.uk/news/business/rss.xml"),
-    ("CNBC",            "https://www.cnbc.com/id/100003114/device/rss/rss.html"),
-    ("CNBC Markets",    "https://www.cnbc.com/id/15839135/device/rss/rss.html"),
-    ("ZeroHedge",       "https://feeds.feedburner.com/zerohedge/feed"),
+    # Tier 1 — Resmi kurumlar
     ("FED",             "https://www.federalreserve.gov/feeds/press_all.xml"),
     ("ECB",             "https://www.ecb.europa.eu/rss/press.html"),
+    ("IMF",             "https://www.imf.org/en/News/rss?language=eng"),
+    ("ABD Disisleri",   "https://www.state.gov/rss-feed/press-releases/feed/"),
+    ("NATO",            "https://www.nato.int/cps/en/natolive/news.rss"),
+    ("IAEA",            "https://www.iaea.org/feeds/topstories.xml"),
+    # Tier 2 — Kaliteli finans/politika medyası
+    ("FT",              "https://www.ft.com/rss/home/us"),
+    ("FT Markets",      "https://www.ft.com/rss/home/uk"),
+    ("WSJ",             "https://feeds.a.dj.com/rss/RSSMarketsMain.xml"),
+    ("WSJ Ekonomi",     "https://feeds.a.dj.com/rss/WSJcomUSBusiness.xml"),
+    ("Axios",           "https://api.axios.com/feed/"),
+    ("Politico",        "https://www.politico.com/rss/politics08.xml"),
+    ("Politico Global", "https://www.politico.eu/rss"),
+    ("BBC Dunya",       "https://feeds.bbci.co.uk/news/world/rss.xml"),
+    ("CNBC Markets",    "https://www.cnbc.com/id/15839135/device/rss/rss.html"),
+    ("ZeroHedge",       "https://feeds.feedburner.com/zerohedge/feed"),
+    # Enerji & jeopolitik
     ("EIA Petrol",      "https://www.eia.gov/rss/todayinenergy.xml"),
     ("OilPrice",        "https://oilprice.com/rss/main"),
     ("ISW",             "https://www.understandingwar.org/rss.xml"),
-    ("Al Monitor TR",   "https://www.al-monitor.com/rss/turkey.xml"),
     ("Al Monitor ME",   "https://www.al-monitor.com/rss/mideast.xml"),
-    ("IAEA",            "https://www.iaea.org/feeds/topstories.xml"),
-    ("ABD Disisleri",   "https://www.state.gov/rss-feed/press-releases/feed/"),
-    ("NATO",            "https://www.nato.int/cps/en/natolive/news.rss"),
+    ("Al Monitor TR",   "https://www.al-monitor.com/rss/turkey.xml"),
+    # Deprem
     ("USGS Deprem",     "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/4.5_day.atom"),
-    ("IMF",             "https://www.imf.org/en/News/rss?language=eng"),
-    ("BIS",             "https://www.bis.org/doclist/bis_fsr.rss"),
 ]
 
 RSS_TURKEY = [
+    # Tier 1 — Resmi kurumlar (mutlaka)
     ("TCMB",            "https://www.tcmb.gov.tr/wps/wcm/connect/TR/rss/"),
     ("SPK",             "https://www.spk.gov.tr/rss/HaberDetay"),
     ("BDDK",            "https://www.bddk.org.tr/Rss/RssDuyuru"),
     ("Hazine",          "https://www.hmb.gov.tr/rss"),
     ("Borsa Istanbul",  "https://www.borsaistanbul.com/tr/rss/haberler"),
     ("Resmi Gazete",    "https://www.resmigazete.gov.tr/rss/tum.xml"),
-    ("BTK",             "https://www.btk.gov.tr/rss"),
-    ("Rekabet Kurumu",  "https://www.rekabet.gov.tr/tr/Rss/Karar"),
+    # Tier 2 — Güvenilir haber ajansları
     ("AA Ekonomi",      "https://www.aa.com.tr/tr/rss/default?cat=ekonomi"),
     ("AA Gundem",       "https://www.aa.com.tr/tr/rss/default?cat=gundem"),
     ("DHA Ekonomi",     "https://www.dha.com.tr/rss/ekonomi.xml"),
     ("Bloomberg HT",    "https://www.bloomberght.com/rss"),
     ("Dunya",           "https://www.dunya.com/rss/rss.xml"),
-    ("Ekonomim",        "https://www.ekonomim.com/rss"),
+    # Tier 2 — Finans odakli
     ("Para Analiz",     "https://www.paraanaliz.com/feed/"),
-    ("Finans Gundem",   "https://www.finansgundem.com/rss"),
-    ("Anka Haber",      "https://www.ankahaber.net/rss.xml"),
-    ("NTV Ekonomi",     "https://www.ntv.com.tr/ekonomi.rss"),
-    ("Hurriyet Ekon",   "https://www.hurriyet.com.tr/rss/ekonomi"),
-    ("Sabah Ekonomi",   "https://www.sabah.com.tr/rss/ekonomi.xml"),
-    ("Sozcu Ekonomi",   "https://www.sozcu.com.tr/rss/ekonomi.xml"),
+    ("Ekonomim",        "https://www.ekonomim.com/rss"),
 ]
 
 HEADERS = {
@@ -1351,22 +1354,26 @@ def yeni_h(kaynak, baslik, url, tip="rss"):
 
 def rss_cek(feeds):
     out = []
+    import time as _t
     for kaynak, url in feeds:
         try:
             feed = feedparser.parse(url, request_headers=HEADERS)
-for e in feed.entries[:6]:
-    b = (e.get("title") or "").strip()
-    if not b or len(b) <= 10:
-        continue
-    published = e.get("published_parsed") or e.get("updated_parsed")
-    if published:
-        import time as _t
-        age_hours = (_t.time() - _t.mktime(published)) / 3600
-        if age_hours > 2:
-            continue
-    out.append(yeni_h(kaynak, b, e.get("link", "")))
+            for e in feed.entries[:6]:
+                b = (e.get("title") or "").strip()
+                if not b or len(b) <= 10:
+                    continue
+                published = e.get("published_parsed") or e.get("updated_parsed")
+                if published:
+                    try:
+                        age_hours = (_t.time() - _t.mktime(published)) / 3600
+                        if age_hours > 2:
+                            continue
+                    except:
+                        pass
+                out.append(yeni_h(kaynak, b, e.get("link", "")))
         except Exception as e:
-            log.debug(f"RSS {kaynak}: {e}")    return out
+            log.debug(f"RSS {kaynak}: {e}")
+    return out
 
 def marketaux_cek():
     out = []
@@ -1468,33 +1475,34 @@ def claude_skore_et(haberler, mod):
         if mod == "global":
             prompt = (
                 f"Sen BIST/VIOP uzmani Turk trader. Global haberleri BIST etkisi ile skorla.\n"
-                f"Tier: T1=resmi/Reuters, T2=Bloomberg/AA, T3=medya\n"
-                f"Petrol haberleri (OPEC/Hurmuz/Iran/EIA) otomatik +2 puan.\n\n"
+                f"Kaynak kalitesi: T1=FED/ECB/Reuters/AP, T2=FT/WSJ/Axios/Politico/Bloomberg, T3=diger\n\n"
+                f"KRITIK SORU: Bu haber BIST'te BUGUN trade edilebilir mi?\n\n"
                 f"PUANLAMA:\n"
-                f"9-10 = Piyasayi ANINDA etkiler: Fed acil, buyuk savas, Hurmuz kapanir\n"
-                f"7-8  = Onemli: Fed/ECB surpriz, petrol %3+, jeopolitik sok\n"
-                f"5-6  = Orta: Beklenen veri, bolgesel gerilim\n"
-                f"0-4  = Gurultu\n"
-                f"T1 kaynak +1, T3 kaynak -1.\n\n"
+                f"9-10 = Aninda etki: Fed acil toplanti, buyuk savas, Hurmuz kapaniyor, nukleer kriz\n"
+                f"8    = Bugun trade edilir: Fed/ECB surpriz karar, petrol %2+, Iran/Rusya yaptirimi, NATO krizi\n"
+                f"7    = Takip edilir: Onemli veri surprizi, jeopolitik gerilim, EM sell-off\n"
+                f"4-6  = Zayif etki: Beklenen veri, kucuk gelisme\n"
+                f"0-3  = BIST ile ilgisi yok: Yerel politika, magazin, spor\n\n"
+                f"T1 kaynak +1, T3 kaynak -1. Petrol/Hurmuz/Iran/OPEC haberleri dikkat.\n\n"
                 f"SADECE JSON:\n"
-                f'[{{"id":1,"skor":9,"yon":"BEARISH","semboller":["TUPRS"],"ozet":"max 12 kelime"}}]\n\n'
+                f'[{{"id":1,"skor":9,"yon":"BEARISH","semboller":["TUPRS","PETKM"],"ozet":"max 10 kelime Turkce"}}]\n\n'
                 f"Haberler:\n{liste}"
             )
         else:
             prompt = (
-                f"Sen BIST/VIOP uzmani Turk trader. Turkiye haberlerini BIST etkisi ile skorla.\n"
+                f"Sen BIST/VIOP uzmani Turk trader. Turkiye haberlerini skorla.\n"
                 f"BIST30: {', '.join(BIST30)}\n"
-                f"[SEMBOL] ile baslayanlar = KAP/sirket haberi!\n"
-                f"Petrol haberleri (OPEC/Hurmuz/Iran/EIA) +2 puan.\n"
-                f"T1 kaynak +1, T3 kaynak -1.\n\n"
+                f"[SEMBOL] ile baslayanlar = KAP/sirket haberi — otomatik +1 puan.\n"
+                f"T1 kaynak (TCMB/SPK/BDDK/AA/Bloomberg HT) +1, diger medya -1.\n\n"
+                f"KRITIK SORU: Bu haber BIST'te BUGUN trade edilebilir mi?\n\n"
                 f"PUANLAMA:\n"
-                f"9-10 = Acil: TCMB surpriz faiz, TL kriz, yaptirim, deprem\n"
-                f"8    = Cok onemli: BIST30 KAP karari, enflasyon/buyume, TCMB/SPK/BDDK karari\n"
-                f"7    = Onemli: Orta sirket haberi, sektor karari\n"
-                f"5-6  = Takip: Kucuk sirket, genel ekonomi\n"
-                f"0-4  = Gurultu\n\n"
+                f"9-10 = Aninda: TCMB surpriz faiz, TL krizi, yaptirimi, buyuk deprem, KAP sermaye artirimi\n"
+                f"8    = Bugun trade edilir: BIST30 KAP karari, TUFE/buyume surprizi, BDDK karari, temettü\n"
+                f"7    = Takip: Sektor haberi, orta sirket, ekonomi yorumu\n"
+                f"4-6  = Zayif: Kucuk sirket, rutin aciklama\n"
+                f"0-3  = GURULTU: Siyaset, spor, magazin, tahmin/yorum\n\n"
                 f"SADECE JSON:\n"
-                f'[{{"id":1,"skor":8,"yon":"BULLISH","semboller":["THYAO"],"ozet":"max 12 kelime"}}]\n\n'
+                f'[{{"id":1,"skor":8,"yon":"BULLISH","semboller":["THYAO"],"ozet":"max 10 kelime Turkce"}}]\n\n'
                 f"Haberler:\n{liste}"
             )
 
