@@ -80,7 +80,7 @@ NOVELTY_HOURS     = 24
 PRICE_INTERVAL    = 120   # Brent fiyat kontrolu her 2 dk
 MACRO_INTERVAL    = 60
 FEEDBACK_INTERVAL = 60
-BRENT_TEKNIK_INTERVAL = 10800  # 30 dk
+BRENT_TEKNIK_INTERVAL = 21600  # 6 saat
 
 TELEGRAM_KANALLARI = []
 
@@ -1355,9 +1355,16 @@ def rss_cek(feeds):
         try:
             feed = feedparser.parse(url, request_headers=HEADERS)
             for e in feed.entries[:6]:
-                b = (e.get("title") or "").strip()
-                if b and len(b) > 10:
-                    out.append(yeni_h(kaynak, b, e.get("link", "")))
+    b = (e.get("title") or "").strip()
+    if not b or len(b) <= 10:
+        continue
+    published = e.get("published_parsed") or e.get("updated_parsed")
+    if published:
+        import time as _t
+        age_hours = (_t.time() - _t.mktime(published)) / 3600
+        if age_hours > 2:
+            continue
+    out.append(yeni_h(kaynak, b, e.get("link", "")))
         except Exception as e:
             log.debug(f"RSS {kaynak}: {e}")
     return out
@@ -1511,7 +1518,7 @@ def claude_skore_et(haberler, mod):
                 raw_skor = max(0, min(10, int(s.get("skor", 0))))
                 # Petrol haberi ise +2
                 if petrol_haberi_mi(haberler[idx].get("baslik","")):
-                    raw_skor = min(10, raw_skor + 2)
+                    raw_skor = min(10, raw_skor + 1)
                 adj_skor = tier_skor_ayarla(raw_skor, haberler[idx].get("tier", 2))
                 haberler[idx].update({
                     "skor":      adj_skor,
