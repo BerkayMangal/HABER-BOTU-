@@ -77,10 +77,10 @@ MAX_TURKEY        = 8
 TURKEY_THRESH     = 7
 GLOBAL_THRESH     = 8
 NOVELTY_HOURS     = 24
-PRICE_INTERVAL    = 120   # Brent fiyat kontrolu her 2 dk
+PRICE_INTERVAL    = 60   # Brent fiyat kontrolu her 1 dk
 MACRO_INTERVAL    = 60
 FEEDBACK_INTERVAL = 60
-BRENT_TEKNIK_INTERVAL = 1800  # 30 dk
+BRENT_TEKNIK_INTERVAL = 21600  # 3 saat
 
 TELEGRAM_KANALLARI = []
 
