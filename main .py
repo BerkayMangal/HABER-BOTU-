@@ -41,12 +41,27 @@ from telethon.sessions import StringSession
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 
+import math
+from html import escape as html_escape
+
 try:
     import numpy as np
     from sklearn.ensemble import GradientBoostingClassifier
     ML_AVAILABLE = True
 except ImportError:
     ML_AVAILABLE = False
+
+try:
+    import yfinance as yf
+    from cachetools import TTLCache
+    FA_AVAILABLE = True
+    FA_RAW_CACHE      = TTLCache(maxsize=500, ttl=43200)
+    FA_ANALYSIS_CACHE = TTLCache(maxsize=500, ttl=43200)
+    FA_TOP10_CACHE    = {"asof": None, "items": []}
+except ImportError:
+    FA_AVAILABLE = False
+    FA_RAW_CACHE = FA_ANALYSIS_CACHE = None
+    FA_TOP10_CACHE = {"asof": None, "items": []}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -77,10 +92,10 @@ MAX_TURKEY        = 8
 TURKEY_THRESH     = 7
 GLOBAL_THRESH     = 8
 NOVELTY_HOURS     = 24
-PRICE_INTERVAL    = 60   # Brent fiyat kontrolu her 1 dk
+PRICE_INTERVAL    = 120   # Brent fiyat kontrolu her 2 dk
 MACRO_INTERVAL    = 60
 FEEDBACK_INTERVAL = 60
-BRENT_TEKNIK_INTERVAL = 21600  # 3 saat
+BRENT_TEKNIK_INTERVAL = 1800  # 30 dk
 
 TELEGRAM_KANALLARI = []
 
@@ -465,6 +480,452 @@ def feedback_keyboard(haber_id):
         InlineKeyboardButton("Gec kaldi",callback_data=f"fb_late_{haber_id}"),
     ]])
 
+
+# ================================================================
+# TEMEL ANALIZ MOTORU (Berkay Fundamentals V4)
+# ================================================================
+FA_UNIVERSE = [
+    "ASELS","THYAO","BIMAS","KCHOL","SISE","EREGL","TUPRS","AKBNK","ISCTR","YKBNK",
+    "GARAN","SAHOL","MGROS","FROTO","TOASO","TCELL","KRDMD","PETKM","ENKAI","TAVHL",
+    "PGSUS","EKGYO","KOZAL","TTKOM","ARCLK","VESTL","DOHOL","AYGAZ","LOGO","SOKM"
+]
+FA_CONFIDENCE_MIN = 55
+FA_BOT_VERSION = "V4"
+
+def fa_normalize(ticker):
+    t = (ticker or "").strip().upper().replace(" ","").replace(".IS","")
+    return f"{t}.IS"
+
+def fa_base(ticker):
+    return (ticker or "").strip().upper().replace(".IS","")
+
+def fa_safe(x):
+    try:
+        if x is None: return None
+        x = float(x)
+        if math.isnan(x) or math.isinf(x): return None
+        return x
+    except: return None
+
+def fa_fmt(x, d=2):
+    x = fa_safe(x)
+    if x is None: return "N/A"
+    if abs(x) >= 1e9: return f"{x/1e9:.2f}B"
+    if abs(x) >= 1e6: return f"{x/1e6:.2f}M"
+    if abs(x) >= 1e3: return f"{x:,.0f}"
+    return f"{x:.{d}f}"
+
+def fa_pct(x, d=1):
+    x = fa_safe(x)
+    if x is None: return "N/A"
+    return f"{x*100:.{d}f}%"
+
+def fa_avg(vals):
+    v = [fa_safe(x) for x in vals if fa_safe(x) is not None]
+    return float(sum(v)/len(v)) if v else None
+
+def fa_score_hi(x, bad, ok, good, great):
+    x = fa_safe(x)
+    if x is None: return None
+    if x <= bad: return 5.0
+    if x >= great: return 100.0
+    if x <= ok: return 5 + (x-bad)*(35/max(ok-bad,1e-9))
+    if x <= good: return 40 + (x-ok)*(35/max(good-ok,1e-9))
+    return 75 + (x-good)*(25/max(great-good,1e-9))
+
+def fa_score_lo(x, great, good, ok, bad):
+    x = fa_safe(x)
+    if x is None: return None
+    if x <= great: return 100.0
+    if x >= bad: return 5.0
+    if x <= good: return 100-(x-great)*(25/max(good-great,1e-9))
+    if x <= ok: return 75-(x-good)*(35/max(ok-good,1e-9))
+    return 40-(x-ok)*(35/max(bad-ok,1e-9))
+
+def fa_pick(df, names):
+    if df is None or not hasattr(df,"index") or df.empty: return None, None
+    import pandas as pd
+    for name in names:
+        if name in df.index:
+            try:
+                s = df.loc[name]
+                if isinstance(s, pd.DataFrame): s = s.iloc[:,0]
+                s = pd.to_numeric(s, errors="coerce").dropna()
+                if s.empty: continue
+                return fa_safe(s.iloc[0]), (fa_safe(s.iloc[1]) if len(s)>1 else None)
+            except: continue
+    return None, None
+
+def fa_growth(cur, prev):
+    cur, prev = fa_safe(cur), fa_safe(prev)
+    if cur is None or prev in (None,0): return None
+    return (cur-prev)/abs(prev)
+
+def fa_fetch_raw(symbol):
+    if not FA_AVAILABLE: return None
+    if symbol in FA_RAW_CACHE: return FA_RAW_CACHE[symbol]
+    try:
+        tk = yf.Ticker(symbol)
+        info = tk.get_info() or {}
+        try: fast = getattr(tk,"fast_info",{}) or {}
+        except: fast = {}
+        raw = {
+            "info": info, "fast": fast,
+            "financials": tk.financials,
+            "balance": tk.balance_sheet,
+            "cashflow": tk.cashflow,
+        }
+        FA_RAW_CACHE[symbol] = raw
+        return raw
+    except Exception as e:
+        log.warning(f"FA fetch {symbol}: {e}")
+        return None
+
+def fa_compute_piotroski(m):
+    pts, used = 0, 0
+    tests = [
+        m.get("roa") is not None and m.get("roa",0) > 0,
+        m.get("operating_cf") is not None and m.get("operating_cf",0) > 0,
+        m.get("roa") is not None and m.get("roa_prev") is not None and m.get("roa",0) > m.get("roa_prev",0),
+        m.get("operating_cf") is not None and m.get("net_income") is not None and m.get("operating_cf",0) > m.get("net_income",0),
+        m.get("current_ratio") is not None and m.get("current_ratio_prev") is not None and m.get("current_ratio",0) > m.get("current_ratio_prev",0),
+        m.get("share_change") is not None and m.get("share_change",1) <= 0,
+        m.get("gross_margin") is not None and m.get("gross_margin_prev") is not None and m.get("gross_margin",0) > m.get("gross_margin_prev",0),
+        m.get("asset_turnover") is not None and m.get("asset_turnover_prev") is not None and m.get("asset_turnover",0) > m.get("asset_turnover_prev",0),
+    ]
+    for t in tests:
+        if t is True or t is False:
+            used += 1; pts += int(t)
+    return pts if used >= 4 else None
+
+def fa_compute_altman(m):
+    wc = fa_safe(m.get("working_capital"))
+    ta = fa_safe(m.get("total_assets"))
+    re_ = fa_safe(m.get("retained_earnings")) or 0.0
+    ebit = fa_safe(m.get("ebit"))
+    tl = fa_safe(m.get("total_liabilities"))
+    sales = fa_safe(m.get("revenue"))
+    mve = fa_safe(m.get("market_cap"))
+    if None in (wc, ta, ebit, tl, sales, mve) or ta==0 or tl==0: return None
+    return 1.2*(wc/ta) + 1.4*(re_/ta) + 3.3*(ebit/ta) + 0.6*(mve/tl) + 1.0*(sales/ta)
+
+def fa_compute_metrics(symbol):
+    raw = fa_fetch_raw(symbol)
+    if raw is None: return None
+    info, fast = raw["info"], raw["fast"]
+    fin, bal, cf = raw["financials"], raw["balance"], raw["cashflow"]
+
+    revenue, revenue_prev           = fa_pick(fin, ["Total Revenue","Operating Revenue"])
+    gross_profit, gross_profit_prev = fa_pick(fin, ["Gross Profit"])
+    operating_income, _             = fa_pick(fin, ["Operating Income","EBIT"])
+    ebit, _                         = fa_pick(fin, ["EBIT","Operating Income"])
+    ebitda, ebitda_prev             = fa_pick(fin, ["EBITDA"])
+    net_income, net_income_prev     = fa_pick(fin, ["Net Income","Net Income Common Stockholders"])
+    interest_exp, _                 = fa_pick(fin, ["Interest Expense","Interest Expense Non Operating"])
+    dil_shares, dil_shares_prev     = fa_pick(fin, ["Diluted Average Shares","Basic Average Shares"])
+    eps_row, eps_row_prev           = fa_pick(fin, ["Diluted EPS","Basic EPS"])
+    sga, sga_prev                   = fa_pick(fin, ["Selling General And Administration"])
+
+    op_cf, _                        = fa_pick(cf, ["Operating Cash Flow","Cash Flow From Continuing Operating Activities"])
+    capex, _                        = fa_pick(cf, ["Capital Expenditure"])
+    dep, dep_prev                   = fa_pick(cf, ["Depreciation","Depreciation And Amortization"])
+
+    total_assets, total_assets_prev = fa_pick(bal, ["Total Assets"])
+    total_liab, _                   = fa_pick(bal, ["Total Liabilities Net Minority Interest","Total Liabilities"])
+    total_debt, total_debt_prev     = fa_pick(bal, ["Total Debt"])
+    cash, _                         = fa_pick(bal, ["Cash Cash Equivalents And Short Term Investments","Cash And Cash Equivalents"])
+    cur_assets, cur_assets_prev     = fa_pick(bal, ["Current Assets","Total Current Assets"])
+    cur_liab, cur_liab_prev         = fa_pick(bal, ["Current Liabilities","Total Current Liabilities"])
+    ret_earn, _                     = fa_pick(bal, ["Retained Earnings"])
+    equity, _                       = fa_pick(bal, ["Stockholders Equity","Total Stockholder Equity"])
+    receivables, rec_prev           = fa_pick(bal, ["Accounts Receivable","Receivables"])
+    ppe, ppe_prev                   = fa_pick(bal, ["Net PPE","Property Plant Equipment Net"])
+
+    price      = fa_safe(fast.get("last_price")) or fa_safe(info.get("currentPrice"))
+    market_cap = fa_safe(fast.get("market_cap")) or fa_safe(info.get("marketCap"))
+    pe         = fa_safe(info.get("trailingPE")) or fa_safe(info.get("forwardPE"))
+    pb         = fa_safe(info.get("priceToBook"))
+    ev_ebitda  = fa_safe(info.get("enterpriseToEbitda"))
+    div_yield  = fa_safe(info.get("dividendYield"))
+    beta       = fa_safe(info.get("beta"))
+
+    roe = fa_safe(info.get("returnOnEquity")) or ((net_income/equity) if net_income and equity else None)
+    roa = fa_safe(info.get("returnOnAssets")) or ((net_income/total_assets) if net_income and total_assets else None)
+    roa_prev = (net_income_prev/total_assets_prev) if net_income_prev and total_assets_prev else None
+
+    gross_margin      = (gross_profit/revenue) if gross_profit and revenue else None
+    gross_margin_prev = (gross_profit_prev/revenue_prev) if gross_profit_prev and revenue_prev else None
+    op_margin         = fa_safe(info.get("operatingMargins")) or ((operating_income/revenue) if operating_income and revenue else None)
+    net_margin        = fa_safe(info.get("profitMargins")) or ((net_income/revenue) if net_income and revenue else None)
+
+    cur_ratio      = fa_safe(info.get("currentRatio")) or ((cur_assets/cur_liab) if cur_assets and cur_liab else None)
+    cur_ratio_prev = (cur_assets_prev/cur_liab_prev) if cur_assets_prev and cur_liab_prev else None
+    debt_eq        = fa_safe(info.get("debtToEquity")) or ((total_debt/equity*100) if total_debt and equity else None)
+
+    net_debt      = (total_debt - cash) if total_debt is not None and cash is not None else None
+    net_debt_ebit = (net_debt/ebitda) if net_debt is not None and ebitda not in (None,0) else None
+    int_cov       = ((ebit or operating_income)/abs(interest_exp)) if (ebit or operating_income) is not None and interest_exp not in (None,0) else None
+
+    trailing_eps   = fa_safe(info.get("trailingEps")) or fa_safe(eps_row)
+    book_val_ps    = fa_safe(info.get("bookValue")) or ((equity/dil_shares) if equity and dil_shares else None)
+    free_cf        = ((op_cf + capex) if op_cf is not None and capex is not None else None) or fa_safe(info.get("freeCashflow"))
+    fcf_yield      = (free_cf/market_cap) if free_cf is not None and market_cap not in (None,0) else None
+    fcf_margin     = (free_cf/revenue) if free_cf is not None and revenue not in (None,0) else None
+    cfo_to_ni      = (op_cf/net_income) if op_cf is not None and net_income not in (None,0) else None
+
+    rev_growth  = fa_safe(info.get("revenueGrowth")) or fa_growth(revenue, revenue_prev)
+    eps_growth  = fa_safe(info.get("earningsGrowth")) or fa_growth(eps_row, eps_row_prev) or fa_growth(net_income, net_income_prev)
+    ebit_growth = fa_growth(ebitda, ebitda_prev)
+
+    wc        = (cur_assets - cur_liab) if cur_assets is not None and cur_liab is not None else None
+    tax_rate  = fa_safe(info.get("effectiveTaxRate")) or 0.20
+    inv_cap   = (total_debt + equity - cash) if total_debt is not None and equity is not None and cash is not None else None
+    nopat     = ((ebit or operating_income)*(1-min(max(tax_rate,0),0.35))) if (ebit or operating_income) is not None else None
+    roic      = (nopat/inv_cap) if nopat is not None and inv_cap not in (None,0) else None
+
+    peg       = (pe/max(eps_growth*100,1e-9)) if pe not in (None,0) and eps_growth is not None and eps_growth > 0 else None
+    graham_fv = ((22.5*trailing_eps*book_val_ps)**0.5) if trailing_eps not in (None,0) and book_val_ps not in (None,0) and trailing_eps > 0 and book_val_ps > 0 else None
+    mos       = ((graham_fv-price)/graham_fv) if graham_fv not in (None,0) and price is not None else None
+    share_ch  = fa_growth(dil_shares, dil_shares_prev)
+    asset_to  = (revenue/total_assets) if revenue is not None and total_assets not in (None,0) else None
+    asset_to_p= (revenue_prev/total_assets_prev) if revenue_prev is not None and total_assets_prev not in (None,0) else None
+
+    m = {
+        "symbol": symbol, "ticker": fa_base(symbol),
+        "name": str(info.get("shortName") or info.get("longName") or symbol),
+        "currency": str(info.get("currency") or ""),
+        "price": price, "market_cap": market_cap,
+        "pe": pe, "pb": pb, "ev_ebitda": ev_ebitda, "dividend_yield": div_yield, "beta": beta,
+        "revenue": revenue, "revenue_prev": revenue_prev,
+        "gross_profit": gross_profit, "gross_profit_prev": gross_profit_prev,
+        "operating_income": operating_income, "ebit": ebit or operating_income,
+        "ebitda": ebitda, "ebitda_prev": ebitda_prev,
+        "net_income": net_income, "net_income_prev": net_income_prev,
+        "operating_cf": op_cf, "free_cf": free_cf,
+        "total_assets": total_assets, "total_assets_prev": total_assets_prev,
+        "total_liabilities": total_liab, "total_debt": total_debt, "total_debt_prev": total_debt_prev,
+        "cash": cash, "cur_assets": cur_assets, "cur_assets_prev": cur_assets_prev,
+        "cur_liab": cur_liab, "cur_liab_prev": cur_liab_prev,
+        "working_capital": wc, "retained_earnings": ret_earn, "equity": equity,
+        "receivables": receivables, "receivables_prev": rec_prev,
+        "ppe": ppe, "ppe_prev": ppe_prev, "depreciation": dep, "depreciation_prev": dep_prev,
+        "sga": sga, "sga_prev": sga_prev,
+        "trailing_eps": trailing_eps, "book_value_ps": book_val_ps,
+        "roe": roe, "roa": roa, "roa_prev": roa_prev, "roic": roic,
+        "gross_margin": gross_margin, "gross_margin_prev": gross_margin_prev,
+        "op_margin": op_margin, "net_margin": net_margin,
+        "current_ratio": cur_ratio, "current_ratio_prev": cur_ratio_prev,
+        "debt_equity": debt_eq, "net_debt_ebitda": net_debt_ebit,
+        "interest_coverage": int_cov,
+        "fcf_yield": fcf_yield, "fcf_margin": fcf_margin, "cfo_to_ni": cfo_to_ni,
+        "revenue_growth": rev_growth, "eps_growth": eps_growth, "ebitda_growth": ebit_growth,
+        "peg": peg, "graham_fv": graham_fv, "margin_safety": mos,
+        "share_change": share_ch, "asset_turnover": asset_to, "asset_turnover_prev": asset_to_p,
+    }
+    m["piotroski_f"] = fa_compute_piotroski(m)
+    m["altman_z"]    = fa_compute_altman(m)
+    return m
+
+def fa_scores(m):
+    value   = fa_avg([
+        fa_score_lo(m.get("pe"), 8,12,18,30) if (m.get("pe") or 0) > 0 else None,
+        fa_score_lo(m.get("pb"), 1,1.8,3,5) if (m.get("pb") or 0) > 0 else None,
+        fa_score_lo(m.get("ev_ebitda"), 5,8,12,18) if (m.get("ev_ebitda") or 0) > 0 else None,
+        fa_score_hi(m.get("fcf_yield"), 0,0.02,0.05,0.08),
+        fa_score_hi(m.get("margin_safety"), -0.2,0,0.15,0.30),
+    ])
+    quality = fa_avg([
+        fa_score_hi(m.get("roe"), 0.02,0.08,0.15,0.25),
+        fa_score_hi(m.get("roic"), 0.02,0.08,0.12,0.20),
+        fa_score_hi(m.get("gross_margin"), 0.10,0.20,0.30,0.45),
+        fa_score_hi(m.get("op_margin"), 0.03,0.08,0.15,0.25),
+        fa_score_hi(m.get("net_margin"), 0.01,0.05,0.10,0.18),
+    ])
+    growth  = fa_avg([
+        fa_score_hi(m.get("revenue_growth"), -0.05,0.03,0.10,0.20),
+        fa_score_hi(m.get("eps_growth"), -0.10,0.03,0.10,0.20),
+        fa_score_hi(m.get("ebitda_growth"), -0.05,0.03,0.10,0.18),
+        fa_score_lo(m.get("peg"), 0.6,1.0,1.8,3.0) if (m.get("peg") or 0) > 0 else None,
+    ])
+    nde = m.get("net_debt_ebitda")
+    nde_s = 100.0 if nde is not None and nde < 0 else fa_score_lo(nde, 0.5,1.5,2.5,4.0)
+    balance = fa_avg([
+        nde_s,
+        fa_score_lo(m.get("debt_equity"), 20,60,120,250),
+        fa_score_hi(m.get("current_ratio"), 0.7,1.0,1.5,2.2),
+        fa_score_hi(m.get("interest_coverage"), 1.0,2.0,5.0,10.0),
+        fa_score_hi(m.get("altman_z"), 1.2,1.8,3.0,4.5),
+    ])
+    earnings = fa_avg([
+        fa_score_hi(m.get("cfo_to_ni"), 0.2,0.6,0.9,1.2),
+        fa_score_hi(m.get("fcf_margin"), -0.02,0,0.05,0.12),
+    ])
+    moat = fa_avg([
+        fa_score_hi(m.get("gross_margin"), 0.10,0.20,0.30,0.45),
+        fa_score_hi(m.get("op_margin"), 0.03,0.08,0.15,0.25),
+        fa_score_hi(m.get("roic"), 0.02,0.08,0.12,0.20),
+    ])
+    capital = fa_avg([
+        fa_score_hi(m.get("dividend_yield"), 0,0.01,0.03,0.06),
+        fa_score_hi(m.get("fcf_yield"), 0,0.02,0.05,0.08),
+        fa_score_hi(m.get("roic"), 0.02,0.08,0.12,0.20),
+    ])
+    return {k: round(v or 50, 1) for k, v in {
+        "value": value, "quality": quality, "growth": growth,
+        "balance": balance, "earnings": earnings, "moat": moat, "capital": capital
+    }.items()}
+
+def fa_analyze(symbol):
+    if not FA_AVAILABLE: return None
+    if symbol in FA_ANALYSIS_CACHE: return FA_ANALYSIS_CACHE[symbol]
+    m = fa_compute_metrics(symbol)
+    if m is None: return None
+    sc = fa_scores(m)
+
+    overall = (0.22*sc["value"] + 0.22*sc["quality"] + 0.16*sc["growth"] +
+               0.16*sc["balance"] + 0.10*sc["earnings"] + 0.09*sc["moat"] + 0.05*sc["capital"])
+    if m.get("equity") is not None and m["equity"] < 0: overall -= 12
+    if m.get("net_income") is not None and m["net_income"] < 0: overall -= 8
+    if m.get("operating_cf") is not None and m["operating_cf"] < 0: overall -= 8
+    overall = round(max(1, min(99, overall)), 1)
+
+    pf = m.get("piotroski_f")
+    az = m.get("altman_z")
+    pf_lbl = ("N/A" if pf is None else f"{int(pf)}/9 (Guclu)" if pf >= 7 else f"{int(pf)}/9 (Orta)" if pf >= 5 else f"{int(pf)}/9 (Zayif)")
+    az_lbl = ("N/A" if az is None else f"{az:.2f} (Guvenli)" if az >= 3 else f"{az:.2f} (Gri)" if az >= 1.8 else f"{az:.2f} (Risk)")
+    buffett = "Gecti" if (sc["quality"] >= 75 and sc["moat"] >= 65 and sc["balance"] >= 60) else ("Sinirda" if sc["quality"] >= 60 else "Kaldi")
+    graham  = "Gecti" if (sc["value"] >= 70 and sc["balance"] >= 60 and (m.get("margin_safety") or -1) >= 0) else ("Sinirda" if sc["value"] >= 55 else "Kaldi")
+
+    conf_keys = ["pe","pb","fcf_yield","roe","roic","op_margin","revenue_growth","eps_growth","net_debt_ebitda","interest_coverage","cfo_to_ni","piotroski_f","altman_z","peg","margin_safety"]
+    confidence = round(100 * sum(1 for k in conf_keys if fa_safe(m.get(k)) is not None) / len(conf_keys), 1)
+
+    r = {
+        "symbol": symbol, "ticker": fa_base(symbol), "name": m["name"], "currency": m["currency"],
+        "metrics": m, "scores": sc, "overall": overall, "confidence": confidence,
+        "pf": pf_lbl, "az": az_lbl, "buffett": buffett, "graham": graham,
+    }
+    FA_ANALYSIS_CACHE[symbol] = r
+    return r
+
+def fa_render(r, view="overview"):
+    s = r["scores"]; m = r["metrics"]; t = html_escape(r["ticker"])
+    hdr = f"<b>BERKAY FUNDAMENTALS [{FA_BOT_VERSION}]</b>\n<b>{t} — Skor: {r['overall']}/100</b>"
+    if view == "overview":
+        return "\n".join([
+            hdr,
+            f"<i>{html_escape(r['name'])}</i>",
+            f"Guvenim: {r['confidence']}/100 | Buffett: {r['buffett']} | Graham: {r['graham']}",
+            f"Fiyat: {fa_fmt(m.get('price'))} {html_escape(r['currency'])}",
+            "",
+            "<b>Skorlar</b>",
+            f"Deger: {s['value']} | Kalite: {s['quality']} | Buyume: {s['growth']}",
+            f"Bilan: {s['balance']} | Kazan: {s['earnings']} | Hendek: {s['moat']}",
+            "",
+            f"Piotroski F: {r['pf']}",
+            f"Altman Z: {r['az']}",
+            f"Graham Guvenlik Marji: {fa_pct(m.get('margin_safety'))}",
+            "",
+            "Butonlarla detaylara bak.",
+        ])
+    elif view == "value":
+        return "\n".join([
+            f"<b>DEGER [{FA_BOT_VERSION}] — {t}</b>",
+            f"F/K: {fa_fmt(m.get('pe'))} | F/DD: {fa_fmt(m.get('pb'))} | EV/EBITDA: {fa_fmt(m.get('ev_ebitda'))}",
+            f"FCF Verimi: {fa_pct(m.get('fcf_yield'))}",
+            f"Graham Deger: {fa_fmt(m.get('graham_fv'))} | Marj: {fa_pct(m.get('margin_safety'))}",
+            f"<b>Deger Skoru: {s['value']}/100</b>",
+        ])
+    elif view == "quality":
+        return "\n".join([
+            f"<b>KALITE [{FA_BOT_VERSION}] — {t}</b>",
+            f"ROE: {fa_pct(m.get('roe'))} | ROIC: {fa_pct(m.get('roic'))}",
+            f"Brut Marj: {fa_pct(m.get('gross_margin'))} | Net Marj: {fa_pct(m.get('net_margin'))}",
+            f"Faaliyet Marj: {fa_pct(m.get('op_margin'))}",
+            f"<b>Kalite Skoru: {s['quality']}/100</b>",
+        ])
+    elif view == "growth":
+        return "\n".join([
+            f"<b>BUYUME [{FA_BOT_VERSION}] — {t}</b>",
+            f"Gelir Buyume: {fa_pct(m.get('revenue_growth'))}",
+            f"EPS Buyume: {fa_pct(m.get('eps_growth'))}",
+            f"EBITDA Buyume: {fa_pct(m.get('ebitda_growth'))}",
+            f"PEG: {fa_fmt(m.get('peg'))}",
+            f"<b>Buyume Skoru: {s['growth']}/100</b>",
+        ])
+    elif view == "balance":
+        return "\n".join([
+            f"<b>BILANCO [{FA_BOT_VERSION}] — {t}</b>",
+            f"Net Borc/EBITDA: {fa_fmt(m.get('net_debt_ebitda'))}",
+            f"Borc/Ozsermaye: {fa_fmt(m.get('debt_equity'))}",
+            f"Cari Oran: {fa_fmt(m.get('current_ratio'))}",
+            f"Faiz Karsilama: {fa_fmt(m.get('interest_coverage'))}",
+            f"Altman Z: {r['az']}",
+            f"<b>Bilanco Skoru: {s['balance']}/100</b>",
+        ])
+    elif view == "legendary":
+        return "\n".join([
+            f"<b>EFSANE METRIKLER [{FA_BOT_VERSION}] — {t}</b>",
+            f"Piotroski F: {r['pf']}",
+            f"Altman Z: {r['az']}",
+            f"Graham Guvenlik Marji: {fa_pct(m.get('margin_safety'))}",
+            f"Buffett Filtresi: {r['buffett']}",
+            f"Graham Filtresi: {r['graham']}",
+        ])
+    return f"Bilinmeyen gorunum: {view}"
+
+def fa_keyboard(ticker):
+    t = fa_base(ticker)
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("Genel", callback_data=f"fa|{t}|overview"),
+            InlineKeyboardButton("Deger", callback_data=f"fa|{t}|value"),
+            InlineKeyboardButton("Kalite", callback_data=f"fa|{t}|quality"),
+        ],
+        [
+            InlineKeyboardButton("Buyume", callback_data=f"fa|{t}|growth"),
+            InlineKeyboardButton("Bilanco", callback_data=f"fa|{t}|balance"),
+            InlineKeyboardButton("Efsane", callback_data=f"fa|{t}|legendary"),
+        ],
+        [
+            InlineKeyboardButton("Top 10", callback_data="fa|TOP10|top10"),
+        ],
+    ])
+
+def fa_top10_text():
+    items = FA_TOP10_CACHE["items"]
+    if not items: return "<b>Top 10 henuz hazir degil. /top10 dene.</b>"
+    stamp = FA_TOP10_CACHE["asof"].strftime("%d.%m.%Y %H:%M")
+    lines = [f"<b>BIST TOP 10 [{FA_BOT_VERSION}] — {stamp}</b>", ""]
+    for i, item in enumerate(items[:10], 1):
+        lines.append(f"{i}. <b>{item['ticker']}</b> — {item['overall']}/100")
+    lines.append("\nTicker'a tikla detay goruntule.")
+    return "\n".join(lines)
+
+def fa_top10_keyboard():
+    items = FA_TOP10_CACHE["items"]
+    rows, row = [], []
+    for item in items[:10]:
+        row.append(InlineKeyboardButton(item["ticker"], callback_data=f"fa|{item['ticker']}|overview"))
+        if len(row) == 3: rows.append(row); row = []
+    if row: rows.append(row)
+    rows.append([InlineKeyboardButton("Yenile", callback_data="fa|TOP10|refresh")])
+    return InlineKeyboardMarkup(rows)
+
+def fa_scan_universe():
+    ranked = []
+    for t in FA_UNIVERSE:
+        try:
+            r = fa_analyze(fa_normalize(t))
+            if r and r["confidence"] >= FA_CONFIDENCE_MIN:
+                ranked.append(r)
+        except Exception as e:
+            log.warning(f"FA scan skip {t}: {e}")
+    ranked.sort(key=lambda x: (x["overall"], x["scores"]["quality"]), reverse=True)
+    import datetime as _dt
+    FA_TOP10_CACHE["asof"] = _dt.datetime.now()
+    FA_TOP10_CACHE["items"] = ranked[:10]
+    return FA_TOP10_CACHE["items"]
+
 update_offset = 0
 
 async def feedback_kontrol(bot):
@@ -472,13 +933,134 @@ async def feedback_kontrol(bot):
     try:
         updates = await bot.get_updates(
             offset=update_offset, timeout=0,
-            allowed_updates=["callback_query"]
+            allowed_updates=["callback_query", "message"]
         )
         for upd in updates:
             update_offset = upd.update_id + 1
+
+            # --- TEMEL ANALIZ KOMUTLARI (mesajlar) ---
+            msg = upd.message
+            if msg and msg.text:
+                txt = (msg.text or "").strip()
+                chat_id = msg.chat.id
+
+                # /analiz THYAO veya THYAO
+                if txt.startswith("/analiz") or txt.startswith("/fa"):
+                    parts = txt.split()
+                    ticker = parts[1].upper() if len(parts) > 1 else ""
+                    if ticker and FA_AVAILABLE:
+                        await bot.send_message(chat_id=chat_id,
+                            text=f"Analiz ediliyor: <b>{ticker}</b>...", parse_mode=ParseMode.HTML)
+                        try:
+                            r = await asyncio.to_thread(fa_analyze, fa_normalize(ticker))
+                            if r:
+                                await bot.send_message(
+                                    chat_id=chat_id,
+                                    text=fa_render(r, "overview"),
+                                    parse_mode=ParseMode.HTML,
+                                    reply_markup=fa_keyboard(ticker)
+                                )
+                            else:
+                                await bot.send_message(chat_id=chat_id,
+                                    text=f"Veri alinamadi: {ticker}", parse_mode=ParseMode.HTML)
+                        except Exception as e:
+                            await bot.send_message(chat_id=chat_id,
+                                text=f"Hata: {e}", parse_mode=ParseMode.HTML)
+                    elif not FA_AVAILABLE:
+                        await bot.send_message(chat_id=chat_id,
+                            text="yfinance yuklu degil, temel analiz devre disi.", parse_mode=ParseMode.HTML)
+                    continue
+
+                # /top10
+                elif txt.strip() == "/top10":
+                    if not FA_AVAILABLE:
+                        await bot.send_message(chat_id=chat_id,
+                            text="yfinance yuklu degil.", parse_mode=ParseMode.HTML)
+                        continue
+                    await bot.send_message(chat_id=chat_id,
+                        text="Top 10 taranıyor... (1-2 dk sürebilir)", parse_mode=ParseMode.HTML)
+                    try:
+                        await asyncio.to_thread(fa_scan_universe)
+                        await bot.send_message(
+                            chat_id=chat_id,
+                            text=fa_top10_text(),
+                            parse_mode=ParseMode.HTML,
+                            reply_markup=fa_top10_keyboard()
+                        )
+                    except Exception as e:
+                        await bot.send_message(chat_id=chat_id,
+                            text=f"Top10 hata: {e}", parse_mode=ParseMode.HTML)
+                    continue
+
+                # /help
+                elif txt.strip() == "/help":
+                    await bot.send_message(chat_id=chat_id, parse_mode=ParseMode.HTML, text=(
+                        "<b>BERKAY TERMINATOR v3.1 KOMUTLAR</b>\n\n"
+                        "<b>Temel Analiz:</b>\n"
+                        "/analiz THYAO — hisse temel analizi\n"
+                        "/top10 — BIST Top 10 tarama\n\n"
+                        "<b>Haber Botu:</b>\n"
+                        "Otomatik calisiyor, haber gelince mesaj atar.\n"
+                        "Geri bildirim butonlari (Iyi/Gurultu/Gec kaldi)"
+                    ))
+                    continue
+
+            # --- CALLBACK SORGULARI ---
             cq = upd.callback_query
             if not cq:
                 continue
+
+            # Temel analiz callback (fa|TICKER|view)
+            if cq.data and cq.data.startswith("fa|"):
+                await bot.answer_callback_query(callback_query_id=cq.id)
+                parts = cq.data.split("|")
+                if len(parts) == 3:
+                    _, ticker, view = parts
+                    if ticker == "TOP10" and view == "refresh":
+                        await bot.send_message(chat_id=cq.message.chat.id,
+                            text="Yenileniyor...", parse_mode=ParseMode.HTML)
+                        await asyncio.to_thread(fa_scan_universe)
+                        await bot.send_message(
+                            chat_id=cq.message.chat.id,
+                            text=fa_top10_text(),
+                            parse_mode=ParseMode.HTML,
+                            reply_markup=fa_top10_keyboard()
+                        )
+                    elif ticker == "TOP10" and view == "top10":
+                        if FA_TOP10_CACHE["items"]:
+                            await bot.send_message(
+                                chat_id=cq.message.chat.id,
+                                text=fa_top10_text(),
+                                parse_mode=ParseMode.HTML,
+                                reply_markup=fa_top10_keyboard()
+                            )
+                        else:
+                            await bot.send_message(chat_id=cq.message.chat.id,
+                                text="/top10 ile tara once.", parse_mode=ParseMode.HTML)
+                    elif FA_AVAILABLE:
+                        try:
+                            r = await asyncio.to_thread(fa_analyze, fa_normalize(ticker))
+                            if r:
+                                try:
+                                    await bot.edit_message_text(
+                                        chat_id=cq.message.chat.id,
+                                        message_id=cq.message.message_id,
+                                        text=fa_render(r, view),
+                                        parse_mode=ParseMode.HTML,
+                                        reply_markup=fa_keyboard(ticker)
+                                    )
+                                except:
+                                    await bot.send_message(
+                                        chat_id=cq.message.chat.id,
+                                        text=fa_render(r, view),
+                                        parse_mode=ParseMode.HTML,
+                                        reply_markup=fa_keyboard(ticker)
+                                    )
+                        except Exception as e:
+                            log.warning(f"FA callback hata: {e}")
+                continue
+
+            # Haber feedback callback (fb_good_123)
             await bot.answer_callback_query(callback_query_id=cq.id, text="Kaydedildi")
             parts = cq.data.split("_")
             if len(parts) == 3 and parts[0] == "fb":
@@ -1890,12 +2472,6 @@ async def ana_dongu():
             now   = time.time()
             simdi = datetime.now()
             dongu_sayac += 1
-                        # ==================== v4.0 SİNYAL + BRENT ====================
-            brent_f = fast_fetcher.get_brent() or 0
-            degisim = 0
-            if fast_fetcher.last_brent and fast_fetcher.last_brent > 0:
-                degisim = (brent_f - fast_fetcher.last_brent) / fast_fetcher.last_brent * 100
-            await signal_engine.kontrol(bot, h if 'h' in locals() and isinstance(h, dict) else {}, degisim)
 
             g_raw = rss_cek(RSS_GLOBAL) + finnhub_genel_cek()
             t_raw = rss_cek(RSS_TURKEY) + marketaux_cek()
@@ -2138,58 +2714,5 @@ async def ana_dongu():
 
         await asyncio.sleep(POLL_INTERVAL)
 
-# ================================================================
-# v4.0 DÜZELTİLMİŞ VERSİYON — RAILWAY'DE ÇALIŞIR (pandas yok)
-# ================================================================
 
-class FastDataFetcher:
-    def __init__(self):
-        self.brent_price = None
-        self.last_brent = 0
-
-    def get_brent(self):
-        try:
-            r = requests.get("https://query1.finance.yahoo.com/v8/finance/chart/BZ=F?interval=1m&range=1d",
-                             headers={"User-Agent": "Mozilla/5.0"}, timeout=5).json()
-            fiyat = r["chart"]["result"][0]["meta"].get("regularMarketPrice")
-            self.brent_price = round(float(fiyat), 2) if fiyat else self.brent_price
-            return self.brent_price
-        except:
-            return self.brent_price
-
-fast_fetcher = FastDataFetcher()
-
-class SignalEngine:
-    async def kontrol(self, bot, h, brent_degisim=0):
-        if not h or h.get("skor", 0) < 8:
-            return
-        if petrol_haberi_mi(h.get("baslik", "")) and brent_degisim > 0.8:
-            msg = "🚀 <b>OTOMATİK SİNYAL v4.0</b>\n\n<b>TUPRS LONG</b>\nGiriş: anlık\nStop: -1.2%\nTP1: +2.4%   TP2: +3.8%\nEdge: 89% (Petrol Şoku)"
-            await bot.send_message(CHAT_ID, msg, parse_mode=ParseMode.HTML)
-        elif h.get("surprise") and abs(h.get("surprise", 0)) > 0.05:
-            yon = "SHORT" if h["surprise"] > 0 else "LONG"
-            msg = f"🚀 <b>OTOMATİK SİNYAL v4.0</b>\n\n<b>GARAN {yon}</b>\nGiriş: anlık\nStop: -1.0%\nTP1: +2.0%   TP2: +3.5%\nEdge: 82% (Macro Surprise)"
-            await bot.send_message(CHAT_ID, msg, parse_mode=ParseMode.HTML)
-
-signal_engine = SignalEngine()
-
-# ==================== ANA DÖNGÜYE EKLE (Adım 2) ====================
-# while True: bloğunun EN BAŞINA (dongu_sayac += 1 satırından hemen sonra) şunu koy:
-#            brent_f = fast_fetcher.get_brent() or 0
-#            degisim = 0
-#            if fast_fetcher.last_brent and fast_fetcher.last_brent > 0:
-#                degisim = (brent_f - fast_fetcher.last_brent) / fast_fetcher.last_brent * 100
-#            await signal_engine.kontrol(bot, h if 'h' in locals() and isinstance(h, dict) else {}, degisim)
-
-# Fast Brent otomatik başlar
-async def brent_ws_loop(self, bot):
-    while True:
-        fiyat = self.get_brent()
-        if fiyat and self.last_brent and abs(fiyat - self.last_brent) / self.last_brent > 0.005:
-            await bot.send_message(CHAT_ID, f"🔴 BRENT ANLIK: {fiyat:.2f}", parse_mode=ParseMode.HTML)
-            self.last_brent = fiyat
-        await asyncio.sleep(30)
-
-FastDataFetcher.brent_ws_loop = brent_ws_loop
-asyncio.create_task(fast_fetcher.brent_ws_loop(bot))
 asyncio.run(ana_dongu())
