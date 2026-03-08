@@ -32,8 +32,6 @@ import re
 import os
 import random
 import sqlite3
-import pandas as pd
-import xgboost as xgb
 from datetime import datetime, timedelta
 from collections import defaultdict
 from bs4 import BeautifulSoup
@@ -2141,7 +2139,7 @@ async def ana_dongu():
         await asyncio.sleep(POLL_INTERVAL)
 
 # ================================================================
-# v4.0 — TAM ENTEGRE (AL BUTONU YOK, HABER KALİTESİ YÜKSEK)
+# v4.0 DÜZELTİLMİŞ VERSİYON — RAILWAY'DE ÇALIŞIR (pandas yok)
 # ================================================================
 
 class FastDataFetcher:
@@ -2175,23 +2173,15 @@ class SignalEngine:
 
 signal_engine = SignalEngine()
 
-class EdgeModel:
-    def egit(self):
-        try:
-            con = sqlite3.connect(DB_PATH)
-            df = pd.read_sql_query("SELECT ai_skor, ml_skor, tier, novelty, surprise, relative_move FROM haberler WHERE relative_move IS NOT NULL", con)
-            con.close()
-            if len(df) < 100: return
-            X = df[['ai_skor','ml_skor','tier','novelty','surprise']].fillna(0)
-            y = (df['relative_move'] > 0.3).astype(int)
-            model = xgb.XGBClassifier(n_estimators=300, learning_rate=0.03, max_depth=5, random_state=42)
-            model.fit(X, y)
-            log.info(f"✅ EdgeModel eğitildi! Accuracy: {model.score(X,y):.1%}")
-        except: pass
+# ==================== ANA DÖNGÜYE EKLE (Adım 2) ====================
+# while True: bloğunun EN BAŞINA (dongu_sayac += 1 satırından hemen sonra) şunu koy:
+#            brent_f = fast_fetcher.get_brent() or 0
+#            degisim = 0
+#            if fast_fetcher.last_brent and fast_fetcher.last_brent > 0:
+#                degisim = (brent_f - fast_fetcher.last_brent) / fast_fetcher.last_brent * 100
+#            await signal_engine.kontrol(bot, h if 'h' in locals() and isinstance(h, dict) else {}, degisim)
 
-edge_model = EdgeModel()
-
-# Fast Brent loop otomatik başlar
+# Fast Brent otomatik başlar
 async def brent_ws_loop(self, bot):
     while True:
         fiyat = self.get_brent()
@@ -2201,6 +2191,5 @@ async def brent_ws_loop(self, bot):
         await asyncio.sleep(30)
 
 FastDataFetcher.brent_ws_loop = brent_ws_loop
-
 asyncio.create_task(fast_fetcher.brent_ws_loop(bot))
 asyncio.run(ana_dongu())
