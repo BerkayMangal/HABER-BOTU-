@@ -20,8 +20,7 @@
 #   Brent Teknik  — Her 30 dk pivot/MA/destek/direnc seviyeleri
 #   Petrol haberleri — oncelikli skorlama (+2 puan)
 # ================================================================
-import pandas as pd
-import xgboost as xgb
+
 import asyncio
 import feedparser
 import requests
@@ -33,6 +32,8 @@ import re
 import os
 import random
 import sqlite3
+import pandas as pd
+import xgboost as xgb
 from datetime import datetime, timedelta
 from collections import defaultdict
 from bs4 import BeautifulSoup
@@ -1891,6 +1892,12 @@ async def ana_dongu():
             now   = time.time()
             simdi = datetime.now()
             dongu_sayac += 1
+                        # ==================== v4.0 SİNYAL + BRENT ====================
+            brent_f = fast_fetcher.get_brent() or 0
+            degisim = 0
+            if fast_fetcher.last_brent and fast_fetcher.last_brent > 0:
+                degisim = (brent_f - fast_fetcher.last_brent) / fast_fetcher.last_brent * 100
+            await signal_engine.kontrol(bot, h if 'h' in locals() and isinstance(h, dict) else {}, degisim)
 
             g_raw = rss_cek(RSS_GLOBAL) + finnhub_genel_cek()
             t_raw = rss_cek(RSS_TURKEY) + marketaux_cek()
@@ -2134,18 +2141,9 @@ async def ana_dongu():
         await asyncio.sleep(POLL_INTERVAL)
 
 # ================================================================
-# v4.0 EKLER — SİNYAL MOTORU + FAST DATA + EDGE MODEL
-# (Sadece buraya yapıştır, hiçbir şeyi silme)
+# v4.0 — TAM ENTEGRE (AL BUTONU YOK, HABER KALİTESİ YÜKSEK)
 # ================================================================
 
-import pandas as pd
-import xgboost as xgb
-import optuna
-from collections import deque
-
-# ================================================================
-# FAST DATA FETCHER (30 saniye gecikme)
-# ================================================================
 class FastDataFetcher:
     def __init__(self):
         self.brent_price = None
@@ -2153,8 +2151,8 @@ class FastDataFetcher:
 
     def get_brent(self):
         try:
-            r = requests.get("https://query1.finance.yahoo.com/v8/finance/chart/BZ=F?interval=1m&range=1d", 
-                           headers={"User-Agent": "Mozilla/5.0"}, timeout=5).json()
+            r = requests.get("https://query1.finance.yahoo.com/v8/finance/chart/BZ=F?interval=1m&range=1d",
+                             headers={"User-Agent": "Mozilla/5.0"}, timeout=5).json()
             fiyat = r["chart"]["result"][0]["meta"].get("regularMarketPrice")
             self.brent_price = round(float(fiyat), 2) if fiyat else self.brent_price
             return self.brent_price
@@ -2163,31 +2161,20 @@ class FastDataFetcher:
 
 fast_fetcher = FastDataFetcher()
 
-# ================================================================
-# SIGNAL ENGINE — Otomatik sinyal + stop + target
-# ================================================================
 class SignalEngine:
-    def __init__(self):
-        self.acik_sinyaller = {}
-
     async def kontrol(self, bot, h, brent_degisim=0):
         if not h or h.get("skor", 0) < 8:
             return
-        sinyal = None
         if petrol_haberi_mi(h.get("baslik", "")) and brent_degisim > 0.8:
-            sinyal = {"sembol":"TUPRS", "yon":"LONG", "giriş":"anlık", "stop":"-1.2%", "tp1":"+2.4%", "tp2":"+3.8%", "edge":"89%"}
-        elif h.get("surprise") and abs(h.get("surprise",0)) > 0.05:
-            sinyal = {"sembol":"GARAN", "yon":"SHORT" if h["surprise"]>0 else "LONG", "giriş":"anlık", "stop":"-1.0%", "tp1":"+2.0%", "tp2":"+3.5%", "edge":"82%"}
-
-        if sinyal:
-            msg = f"🚀 <b>OTOMATİK SİNYAL v4.0</b>\n\n{signal['sembol']} {sinyal['yon']}\nGiriş: {sinyal['giriş']}\nStop: {sinyal['stop']}\nTP1: {sinyal['tp1']}  TP2: {sinyal['tp2']}\nEdge: {sinyal['edge']}"
+            msg = "🚀 <b>OTOMATİK SİNYAL v4.0</b>\n\n<b>TUPRS LONG</b>\nGiriş: anlık\nStop: -1.2%\nTP1: +2.4%   TP2: +3.8%\nEdge: 89% (Petrol Şoku)"
+            await bot.send_message(CHAT_ID, msg, parse_mode=ParseMode.HTML)
+        elif h.get("surprise") and abs(h.get("surprise", 0)) > 0.05:
+            yon = "SHORT" if h["surprise"] > 0 else "LONG"
+            msg = f"🚀 <b>OTOMATİK SİNYAL v4.0</b>\n\n<b>GARAN {yon}</b>\nGiriş: anlık\nStop: -1.0%\nTP1: +2.0%   TP2: +3.5%\nEdge: 82% (Macro Surprise)"
             await bot.send_message(CHAT_ID, msg, parse_mode=ParseMode.HTML)
 
 signal_engine = SignalEngine()
 
-# ================================================================
-# EDGE MODEL (XGBoost)
-# ================================================================
 class EdgeModel:
     def egit(self):
         try:
@@ -2204,17 +2191,16 @@ class EdgeModel:
 
 edge_model = EdgeModel()
 
-# ================================================================
-# ANA DÖNGÜYE ENTEGRASYON (otomatik çalışır)
-# ================================================================
-# Bu satırları ana_dongu() içindeki while True: bloğunun en başına ekle (yaklaşık 780. satır civarı)
-            brent_f = fast_fetcher.get_brent() or 0
-            degisim = 0
-            if fast_fetcher.last_brent and fast_fetcher.last_brent > 0:
-                degisim = (brent_f - fast_fetcher.last_brent) / fast_fetcher.last_brent * 100
-            await signal_engine.kontrol(bot, h if 'h' in locals() and isinstance(h, dict) else {}, degisim)
+# Fast Brent loop otomatik başlar
+async def brent_ws_loop(self, bot):
+    while True:
+        fiyat = self.get_brent()
+        if fiyat and self.last_brent and abs(fiyat - self.last_brent) / self.last_brent > 0.005:
+            await bot.send_message(CHAT_ID, f"🔴 BRENT ANLIK: {fiyat:.2f}", parse_mode=ParseMode.HTML)
+            self.last_brent = fiyat
+        await asyncio.sleep(30)
 
-# En alta (asyncio.run(ana_dongu()) satırından hemen önce) şunu ekle:
-asyncio.create_task(fast_fetcher.brent_ws_loop(bot)) if 'brent_ws_loop' in dir(fast_fetcher) else None
+FastDataFetcher.brent_ws_loop = brent_ws_loop
 
+asyncio.create_task(fast_fetcher.brent_ws_loop(bot))
 asyncio.run(ana_dongu())
