@@ -89,13 +89,13 @@ POLL_INTERVAL     = 12
 AI_INTERVAL       = 35
 MAX_GLOBAL        = 3
 MAX_TURKEY        = 8
-TURKEY_THRESH     = 7
-GLOBAL_THRESH     = 8
+TURKEY_THRESH     = 8
+GLOBAL_THRESH     = 7
 NOVELTY_HOURS     = 24
 PRICE_INTERVAL    = 120   # Brent fiyat kontrolu her 2 dk
 MACRO_INTERVAL    = 60
 FEEDBACK_INTERVAL = 60
-BRENT_TEKNIK_INTERVAL = 1800  # 30 dk
+BRENT_TEKNIK_INTERVAL = 21600  # 6 saat
 
 TELEGRAM_KANALLARI = []
 
@@ -1012,7 +1012,7 @@ async def feedback_kontrol(bot):
 
             # Temel analiz callback (fa|TICKER|view)
             if cq.data and cq.data.startswith("fa|"):
-                await bot.answer_callback_query(callback_query_id=cq.id)
+                await bot.answer_callback_query(callback_query_id=cq.id, text="Yukleniyor...")
                 parts = cq.data.split("|")
                 if len(parts) == 3:
                     _, ticker, view = parts
@@ -1084,8 +1084,8 @@ class BrentRadar:
         self.onceki_fiyat   = None
         self.baz_fiyat      = None   # alarm bazi (son alarmdan sonra reset)
         self.son_teknik     = 0.0
-        self.ESIK_SARI      = 0.5
-        self.ESIK_KIRMIZI   = 1.0
+        self.ESIK_SARI      = 2.0
+        self.ESIK_KIRMIZI   = 3.0
         self.TEKNIK_INTERVAL= BRENT_TEKNIK_INTERVAL
 
     def _brent_fiyat_cek(self):
