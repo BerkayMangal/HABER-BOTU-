@@ -98,7 +98,7 @@ MARKETAUX_KEY     = os.environ["MARKETAUX_KEY"]
 TELEGRAM_API_ID   = int(os.environ["TELEGRAM_API_ID"])
 TELEGRAM_API_HASH = os.environ["TELEGRAM_API_HASH"]
 TELETHON_SESSION  = os.environ.get("TELETHON_SESSION", "")
-CLAUDE_MODEL      = os.environ.get("CLAUDE_MODEL", CLAUDE_MODEL)
+CLAUDE_MODEL      = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-20250514")
 
 # ================================================================
 # AYARLAR
