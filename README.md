@@ -1,14 +1,48 @@
-🚀 BERKAY TERMINATOR v3.3 & FUNDAMENTALS V4Ultimate Algorithmic Trading, AI News & Macro Terminal for BIST & Global Markets"Bu sıradan bir Telegram botu değil; piyasanın gürültüsünü filtreleyen, temel ve teknik analizi yapay zeka ile harmanlayan ve kendi kendine öğrenen tam teşekküllü bir algoritmik piyasa terminalidir."Berkay Terminator, Borsa İstanbul (BIST) ve Küresel Piyasalar için tasarlanmış modüler bir zeka motorudur. Haber akışlarını saniyeler içinde okur, Claude AI ile skorlar, şirketin temel analiz röntgenini çeker, makro takvimi takip eder ve XGBoost makine öğrenimi modeliyle VİOP sinyallerini filtreleyip Telegram üzerinden size sunar.🔥 Neden "Terminator"? (Ana Özellikler)🧠 1. Yapay Zeka Destekli Haber Motoru (Claude AI)Sistem; Reuters, Bloomberg, AP, TCMB, SPK, KAP ve onlarca RSS kaynağından akan binlerce haberi saniyeler içinde okur. Claude AI, her haberi bir "Türk Trader" gözüyle analiz eder, BIST'e etkisini (0-10 arası) puanlar, "Bullish/Bearish" yönünü belirler ve sadece trade edilebilir düzeydeki (dinamik eşik 7+) haberleri anında cebinize gönderir. Gürültüye son!📊 2. Berkay Fundamentals V4 (Temel Analiz Motoru)Sadece Telegram'a THYAO yazın ve arkanıza yaslanın. Yfinance destekli bu motor:Efsanevi Metrikler: Piotroski F-Score, Altman Z-Score, Beneish M-Score, Graham Güvenlik Marjı.Akıllı Skorlama: Değer, Kalite, Büyüme, Bilanço, Kazanç ve Hendek (Moat) kategorilerinde 100 üzerinden puanlama.Stil Etiketi: Şirketi "Quality Compounder", "Deep Value", "GARP" gibi otomatik sınıflandırma.Top 10: Tüm BIST30/50 evrenini arka planda tarayıp en iyi 10 hisseyi listeleme.🤖 3. XGBoost Destekli VİOP Sinyal Sunucusu (Webhook)TradingView'dan gelen ham VİOP sinyalleri, aiohttp tabanlı asenkron webhook sunucusuna düşer. Önceden eğitilmiş VİOP v26 Machine Learning (XGBoost) modeli, 17 farklı teknik özelliği analiz ederek sinyalin kazanma ihtimalini (Probability) hesaplar. Sadece %65+ başarı ihtimali olan sinyaller Telegram'a düşer!🌍 4. Makro Ekonomi ve Piyasa RadarıBrent, DXY, VIX, USDTRY Radarı: Piyasadaki sert hareketleri (%0.5, %1 vs.) anında yakalayıp "Sarı" ve "Kırmızı" alarmlar üretir.Makro Motor: ABD enflasyonu, TCMB faiz kararları, Tarımdışı İstihdam verilerini bekler. Veri gelmeden 30 dk önce uyarır, veri geldiği saniye sapmayı (surprise) ölçer ve 5 dk sonra ilk piyasa tepkisini raporlar.🐦 5. X (Twitter) Sentiment Heatmaptwscrape entegrasyonu ile hisse senetleri hakkındaki anlık "Heat (Ateş)" skorunu 0-100 arasında ölçer. Squeeze veya Pump durumlarında "Çılgın Ateş" alarmları gönderir.🏗️ Mimari Yapı (Microservices within Docker)Sistem, maksimum performans ve stabilite için tek bir Docker container'ı içinde asenkron olarak çalışan 3 farklı mikro-servisten oluşur:main.py -> Haber toplayıcı, Claude AI skorlayıcı, makro/radar motoru ve zamanlanmış raporlar (Sabah/Öğle/Akşam brifingleri).fa_bot.py -> Bağımsız temel analiz botu (yfinance & pandas).viop_server.py -> Aiohttp tabanlı, asenkron TradingView webhook sunucusu ve ML Predictor.🛠️ Kurulum & Deployment (Railway / Docker)Bu proje Railway veya herhangi bir Docker destekli sunucuda tek tıkla çalışacak şekilde tasarlanmıştır.Ortam Değişkenleri (Environment Variables)Uygulamanın çalışması için aşağıdaki anahtarları ortamınıza ekleyin:Code snippetTELEGRAM_TOKEN="bot_token_buraya"
-FA_BOT_TOKEN="temel_analiz_bot_token_buraya"
-CHAT_ID="telegram_chat_id"
-ANTHROPIC_KEY="claude_api_key_buraya"
-FINNHUB_KEY="finnhub_api_key"
-MARKETAUX_KEY="marketaux_api_key"
-TELEGRAM_API_ID="telethon_api_id"
-TELEGRAM_API_HASH="telethon_api_hash"
-TELETHON_SESSION="telethon_string_session"
-CLAUDE_MODEL="claude-3-5-sonnet-20241022"
-PORT="8080" # Webhook sunucusu için
-Çalıştırma (Docker)Bashdocker build -t berkay-terminator .
-docker run --env-file .env -p 8080:8080 berkay-terminator
-📱 Telegram KomutlarıKomutAçıklamaHangi Bot?[TICKER] (Örn: TCELL)Anında detaylı temel analiz raporu ve skor kartı sunar.FA Bot/top10BIST evrenini tarayıp en yüksek skorlu 10 hisseyi listeler.FA Bot/radarBrent, XU030, DXY ve USDTRY için anlık piyasa durumunu çeker.Ana Bot/durumSistemin uptime, veritabanı durumu ve dinamik eşik seviyelerini gösterir.Ana Bot/heat THYAOSeçilen hisse için Twitter (X) duyarlılık (sentiment) analizini yapar.Ana Bot/watch THYAOHisseyi izleme listesine ekler (Bu hisselerle ilgili haberler AI tarafında önceliklendirilir).Ana Bot📅 Zamanlanmış Raporlar (Auto-Briefings)Sistem size günde 3 kez piyasa raporu sunar:🌅 Sabah Brifingi (09:45): Gecenin özeti, günün makro takvimi ve yapay zeka destekli piyasa yönü tahmini.☀️ Öğlen Raporu (13:00): Günün ilk yarısının en sıcak hisseleri ve haberleri.📊 Günün Özeti (17:45): O gün atılan kritik haberler, VİOP ML modelinin doğruluğu (isabet oranı) ve yarının takvimi.
+# 🤖 Berkay Terminator v3.3 & Fundamentals v4
+
+[![Python 3.11](https://img.shields.io/badge/Python-3.11-blue.svg)](https://www.python.org/)
+[![Docker](https://img.shields.io/badge/Docker-Supported-2496ED.svg)](https://www.docker.com/)
+[![Claude AI](https://img.shields.io/badge/AI-Claude_3.5-7C3AED.svg)](https://www.anthropic.com/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
+
+Berkay Terminator, **Borsa İstanbul (BİST)** ve küresel piyasalar için geliştirilmiş; haber akışını yapay zeka ile filtreleyen, algoritmik temel analiz yapan ve makine öğrenimi (XGBoost) ile VİOP sinyalleri üreten tam teşekküllü bir Telegram piyasa terminalidir.
+
+---
+
+## ✨ Öne Çıkan Özellikler
+
+* **🧠 AI Destekli Haber Filtresi:** Onlarca RSS ve API kaynağından akan haberleri Claude 3.5 ile "Trader" gözüyle skorlar. Sadece piyasayı etkileyecek (7+ puan) haberleri Telegram'dan gönderir.
+* **📊 Berkay Fundamentals v4:** Herhangi bir hisse kodunu (Örn: `TCELL`) bota yazdığınızda saniyeler içinde Piotroski F, Altman Z, Beneish M ve Graham metriklerini hesaplar; değer, kalite ve büyüme skoru üretir.
+* **🎯 VİOP ML Sinyal Motoru:** TradingView'dan gelen ham sinyalleri yakalar. Eğitilmiş XGBoost modeli ile sinyalin başarı ihtimalini (Prob) hesaplar ve sadece kârlı olma ihtimali yüksek (>%65) işlemleri iletir.
+* **🌍 Makro & Radar Sistemi:** Brent petrol, DXY, VIX ve USDTRY'deki sert hareketleri anlık yakalar. ABD/TR makroekonomik verilerinden 30 dk önce uyarır, açıklandığı an sapmayı hesaplar.
+* **🔥 Twitter (X) Sentiment:** `twscrape` kullanarak hisselerin anlık sosyal medya sıcaklık (heat) haritasını çıkarır.
+
+---
+
+## 🏗️ Sistem Mimarisi
+
+Proje, tek bir Docker container'ı içinde paralel çalışan 3 farklı mikro-servisten oluşur:
+
+1. `main.py` : Ana haber motoru, AI skorlama, piyasa radarı ve periyodik raporlar (Sabah/Öğle/Akşam brifingleri).
+2. `fa_bot.py` : Sadece finansal verilere (yfinance) odaklanmış bağımsız Temel Analiz botu.
+3. `viop_server.py` : `aiohttp` tabanlı asenkron webhook sunucusu ve ML Predictor.
+
+---
+
+## 🚀 Kurulum & Çalıştırma
+
+Sistem **Railway** veya herhangi bir Docker ortamında çalışmaya hazırdır. 
+
+**1. Çevresel Değişkenler (`.env`)**
+Aşağıdaki değişkenleri sunucunuza ekleyin:
+```ini
+TELEGRAM_TOKEN=ana_bot_token
+FA_BOT_TOKEN=temel_analiz_bot_token
+CHAT_ID=telegram_chat_id
+ANTHROPIC_KEY=claude_api_key
+FINNHUB_KEY=finnhub_api_key
+MARKETAUX_KEY=marketaux_api_key
+TELEGRAM_API_ID=telethon_id
+TELEGRAM_API_HASH=telethon_hash
+TELETHON_SESSION=telethon_session_string
+PORT=8080
