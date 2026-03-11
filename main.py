@@ -72,8 +72,8 @@ try:
     import yfinance as yf
     from cachetools import TTLCache
     FA_AVAILABLE = True
-    FA_RAW_CACHE      = TTLCache(maxsize=500, ttl=43200)
-    FA_ANALYSIS_CACHE = TTLCache(maxsize=500, ttl=43200)
+    FA_RAW_CACHE      = TTLCache(maxsize=500, ttl=86400)   # 24 saat (fundamentals gun ici degismez)
+    FA_ANALYSIS_CACHE = TTLCache(maxsize=500, ttl=86400)   # 24 saat
     FA_TOP10_CACHE    = {"asof": None, "items": []}
 except ImportError:
     FA_AVAILABLE = False
@@ -107,13 +107,13 @@ POLL_INTERVAL     = 12
 AI_INTERVAL       = 35
 MAX_GLOBAL        = 3
 MAX_TURKEY        = 8
-TURKEY_THRESH     = 8
+TURKEY_THRESH     = 7
 GLOBAL_THRESH     = 7
 NOVELTY_HOURS     = 24
 PRICE_INTERVAL    = 120   # Brent fiyat kontrolu her 2 dk
 MACRO_INTERVAL    = 60
 FEEDBACK_INTERVAL = 60
-BRENT_TEKNIK_INTERVAL = 1800  # 30 dakika
+BRENT_TEKNIK_INTERVAL = 21600  # 6 saat
 
 # Telethon kanallari — env'den virgul ile ayrilmis, bossa bos liste
 _kanals = os.environ.get("TELEGRAM_KANALLARI", "")
@@ -608,6 +608,8 @@ class XSentimentEngine:
         self.HEAT_THRESHOLD = 75          # %75 ustu alarm
         self.TWEET_LIMIT = 35
         self.heat_cache = {}              # ticker -> (skor, timestamp)
+        self._no_accounts = False         # hesap yoksa tekrar deneme
+        self._init_tried = False
 
         self.TICKER_QUERIES = {
             "THYAO": "THYAO OR thy hava yollari",
@@ -648,12 +650,24 @@ class XSentimentEngine:
         return True
 
     async def heat_kontrol(self, bot):
+        if self._no_accounts:
+            return  # hesap yok, sessizce atla
         if time.time() - self.last_scan < self.SCAN_INTERVAL:
             return
         ok = await self.init_api()
         if not ok:
             return
         self.last_scan = time.time()
+
+        # Hesap var mi kontrol — ilk taramada belli olur
+        if not self._init_tried:
+            self._init_tried = True
+            try:
+                test_tweets = await tw_gather(self.api.search("BIST", limit=1))
+            except Exception:
+                log.info("X Sentiment: hesap yok, devre disi. /heat komutu da calismiyor.")
+                self._no_accounts = True
+                return
 
         # Her seferde 8 ticker tara (rate limit korumasi)
         tickers = list(self.TICKER_QUERIES.keys())
@@ -887,7 +901,9 @@ def feedback_keyboard(haber_id):
 FA_UNIVERSE = [
     "ASELS","THYAO","BIMAS","KCHOL","SISE","EREGL","TUPRS","AKBNK","ISCTR","YKBNK",
     "GARAN","SAHOL","MGROS","FROTO","TOASO","TCELL","KRDMD","PETKM","ENKAI","TAVHL",
-    "PGSUS","EKGYO","KOZAL","TTKOM","ARCLK","VESTL","DOHOL","AYGAZ","LOGO","SOKM"
+    "PGSUS","EKGYO","KOZAL","TTKOM","ARCLK","VESTL","DOHOL","AYGAZ","LOGO","SOKM",
+    # v3.3 ek — populer hisseler
+    "TKFEN","KONTR","ODAS","GUBRF","SASA","ISMEN","OYAKC","CIMSA","MPARK","AKSEN",
 ]
 FA_CONFIDENCE_MIN = 55
 FA_BOT_VERSION = "V4"
@@ -965,31 +981,40 @@ def fa_fetch_raw(symbol):
     if not FA_AVAILABLE: return None
     if symbol in FA_RAW_CACHE: return FA_RAW_CACHE[symbol]
     try:
-        tk = yf.Ticker(symbol)
-        info = tk.get_info() or {}
-        try: fast = getattr(tk,"fast_info",{}) or {}
-        except Exception: fast = {}
-        # yfinance v0.2.40+ deprecated property'ler icin fallback
-        try:
-            financials = tk.get_financials()
-        except Exception:
-            financials = tk.financials
-        try:
-            balance = tk.get_balance_sheet()
-        except Exception:
-            balance = tk.balance_sheet
-        try:
-            cashflow = tk.get_cashflow()
-        except Exception:
-            cashflow = tk.cashflow
-        raw = {
-            "info": info, "fast": fast,
-            "financials": financials,
-            "balance": balance,
-            "cashflow": cashflow,
-        }
+        import concurrent.futures
+        def _fetch():
+            tk = yf.Ticker(symbol)
+            info = tk.get_info() or {}
+            try: fast = getattr(tk,"fast_info",{}) or {}
+            except Exception: fast = {}
+            # yfinance deprecated property'ler icin fallback
+            try:
+                financials = tk.get_financials()
+            except Exception:
+                financials = tk.financials
+            try:
+                balance = tk.get_balance_sheet()
+            except Exception:
+                balance = tk.balance_sheet
+            try:
+                cashflow = tk.get_cashflow()
+            except Exception:
+                cashflow = tk.cashflow
+            return {
+                "info": info, "fast": fast,
+                "financials": financials,
+                "balance": balance,
+                "cashflow": cashflow,
+            }
+        # 20 saniye timeout — Railway yavaşsa asılmasın
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(_fetch)
+            raw = future.result(timeout=20)
         FA_RAW_CACHE[symbol] = raw
         return raw
+    except concurrent.futures.TimeoutError:
+        log.warning(f"FA fetch timeout: {symbol}")
+        return None
     except Exception as e:
         log.warning(f"FA fetch {symbol}: {e}")
         return None
@@ -1361,13 +1386,15 @@ async def feedback_kontrol(bot):
                 txt = (msg.text or "").strip()
                 chat_id = msg.chat.id
 
-                # Bare ticker tespiti: "TCELL", "thyao", "GARAN" gibi
+                # Bare ticker tespiti: "TCELL", "thyao", "TKFEN" gibi
+                # BIST ticker'lari 3-5 harf, hepsi alpha
+                # Liste kontrolu YOK — yfinance veri bulamazsa "veri yok" der
                 bare_ticker = txt.upper().replace(".IS","").replace(" ","")
                 is_bare_ticker = (
-                    len(bare_ticker) >= 3 and len(bare_ticker) <= 6
+                    len(bare_ticker) >= 3 and len(bare_ticker) <= 5
                     and bare_ticker.isalpha()
-                    and bare_ticker in (FA_UNIVERSE + [t for t in BIST30 if t not in FA_UNIVERSE])
                     and not txt.startswith("/")
+                    and bare_ticker not in ("HELP","START","WATCH","RADAR","DURUM","HEAT","ALERT","STATUS")
                 )
 
                 # /analiz THYAO veya /fa THYAO veya sadece THYAO
@@ -1619,8 +1646,8 @@ class BrentRadar:
         self.onceki_fiyat   = None
         self.baz_fiyat      = None   # alarm bazi (son alarmdan sonra reset)
         self.son_teknik     = 0.0
-        self.ESIK_SARI      = 0.5   # %0.5 sari alarm (onceki 2.0 cok gec alarm veriyordu)
-        self.ESIK_KIRMIZI   = 1.0   # %1.0 kirmizi alarm
+        self.ESIK_SARI      = 1.5   # %1.5 sari alarm
+        self.ESIK_KIRMIZI   = 3.0   # %3.0 kirmizi alarm
         self.TEKNIK_INTERVAL= BRENT_TEKNIK_INTERVAL
 
     def _brent_fiyat_cek(self):
@@ -2086,7 +2113,7 @@ class MacroEngine:
             # Hardcoded TR takvim kontrolu
             await self._hardcoded_tr_kontrol(bot)
         except Exception as e:
-            log.debug(f"MacroEngine: {e}")
+            log.warning(f"MacroEngine: {e}")
 
     async def _process_event(self, bot, ev, ev_time, event_name, country, impact):
         now      = ist_now()
@@ -3093,17 +3120,19 @@ async def oglen_brifing(bot):
 # FA PRE-CACHE — arka planda tum universe'u tara
 # ================================================================
 def fa_precache_all():
-    """Tum FA_UNIVERSE'u background'da cache'le"""
+    """Tum FA_UNIVERSE + watchlist'i background'da cache'le"""
     if not FA_AVAILABLE:
         return
+    tickers = list(FA_UNIVERSE) + [t for t in watchlist.liste() if t not in FA_UNIVERSE]
     cached = 0
-    for t in FA_UNIVERSE:
+    for t in tickers:
         try:
             fa_analyze(fa_normalize(t))
             cached += 1
         except Exception:
             pass
-    log.info(f"FA pre-cache: {cached}/{len(FA_UNIVERSE)} hisse")
+        time.sleep(0.5)  # Yahoo rate limit nazik
+    log.info(f"FA pre-cache: {cached}/{len(tickers)} hisse")
 
 # ================================================================
 # FEEDBACK LONG-POLL TASK — ayri task, surekli dinle
@@ -3164,7 +3193,7 @@ async def ana_dongu():
 
             "<b>🔔 OTOMATİK ALARMLAR</b>\n"
             "Haber skoru 7+ → otomatik mesaj\n"
-            "Brent %0.5+ → sari, %1+ → kirmizi\n"
+            "Brent %1.5+ → sari, %3+ → kirmizi\n"
             "DXY/VIX/XU030/USDTRY radar\n"
             f"X Sentiment {'aktif' if TWSCRAPE_AVAILABLE else 'pasif (twscrape yukle)'}\n"
             "Momentum (15dk 3+ haber → alarm)\n"
@@ -3173,7 +3202,8 @@ async def ana_dongu():
             "<b>📊 ZAMANLI RAPORLAR</b>\n"
             "09:45  Sabah brifing\n"
             "13:00  Oglen rapor\n"
-            "17:45  Aksam ozet + yarin\n\n"
+            "17:45  Aksam ozet + yarin\n"
+            "6 saatte bir  Brent teknik\n\n"
 
             "<b>⚙️ MOTORLAR</b>\n"
             f"RSS: GL{len(RSS_GLOBAL)} + TR{len(RSS_TURKEY)} kaynak\n"
@@ -3347,12 +3377,15 @@ async def ana_dongu():
                 else:
                     log.info(f"Esik yok (TR={state.turkey_thresh} GL={state.global_thresh})")
 
+            # Dinamik esik — her dongude kontrol (AI scoring disinda da dusebilsin)
+            state.dinamik_esik_guncelle([])
+
             # Brent fiyat kontrolu (her 2 dk)
             if (now - state.son_brent_fiyat) >= PRICE_INTERVAL:
                 state.son_brent_fiyat = now
                 await brent_radar.fiyat_kontrol(bot)
 
-            # Brent teknik (her 30 dk)
+            # Brent teknik (her 6 saat)
             if (now - state.son_brent_teknik) >= BRENT_TEKNIK_INTERVAL:
                 state.son_brent_teknik = now
                 await brent_radar.teknik_gonder(bot)
