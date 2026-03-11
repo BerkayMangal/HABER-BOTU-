@@ -884,6 +884,156 @@ def feedback_keyboard(haber_id):
     ]])
 
 
+update_offset = 0
+
+async def feedback_kontrol(bot):
+    global update_offset
+    try:
+        updates = await bot.get_updates(
+            offset=update_offset, timeout=0,
+            allowed_updates=["callback_query", "message"]
+        )
+        for upd in updates:
+            update_offset = upd.update_id + 1
+
+            # --- KOMUTLAR ---
+            msg = upd.message
+            if msg and msg.text:
+                txt = (msg.text or "").strip()
+                chat_id = msg.chat.id
+
+                # /help
+                if txt.strip() == "/help":
+                    await bot.send_message(chat_id=chat_id, parse_mode=ParseMode.HTML, text=(
+                        "<b>BERKAY TERMINATOR v3.3</b>\n\n"
+                        "<b>Piyasa:</b>\n"
+                        "/radar — canli fiyatlar\n"
+                        "/heat THYAO — X heat skoru\n"
+                        "/durum — sistem durumu\n\n"
+                        "<b>Watchlist:</b>\n"
+                        "/watch THYAO GARAN — ekle\n"
+                        "/unwatch THYAO — cikar\n"
+                        "/watchlist — listeyi gor\n\n"
+                        "<b>Otomatik:</b>\n"
+                        "Haberler, Brent/DXY/VIX alarm,\n"
+                        "X Sentiment, Macro takvim,\n"
+                        "09:45 / 13:00 / 17:45 raporlar"
+                    ))
+                    continue
+
+                # /durum
+                elif txt.strip() in ("/durum", "/status"):
+                    try:
+                        with db_connect() as con:
+                            tk  = con.execute("SELECT COUNT(*) FROM haberler").fetchone()[0]
+                            mlv = con.execute("SELECT COUNT(*) FROM haberler WHERE relative_move IS NOT NULL").fetchone()[0]
+                            fbc = con.execute("SELECT COUNT(*) FROM haberler WHERE feedback IS NOT NULL").fetchone()[0]
+                    except Exception:
+                        tk, mlv, fbc = 0, 0, 0
+                    uptime_h = int((ist_now() - state.baslangic).total_seconds() // 3600)
+                    brent_su = brent_radar._brent_fiyat_cek()
+                    await bot.send_message(chat_id=chat_id, parse_mode=ParseMode.HTML, text=(
+                        f"<b>SISTEM DURUMU</b>\n\n"
+                        f"Calisma: {uptime_h} saat\n"
+                        f"Gonderilen: {state.toplam_gonderilen} haber\n"
+                        f"DB: {tk} kayit | ML: {mlv}/{ml.MIN_VERI}\n"
+                        f"TR Esik: {state.turkey_thresh} | GL Esik: {state.global_thresh}\n"
+                        f"Brent: {brent_su:.2f if brent_su else '—'}\n"
+                        f"Watchlist: {', '.join(watchlist.liste()) or '—'}\n"
+                        f"{ist_now().strftime('%d.%m.%Y %H:%M')}"
+                    ))
+                    continue
+
+                # /radar
+                elif txt.strip() == "/radar":
+                    parts_r = []
+                    for inst in ["XU030", "USDTRY"]:
+                        cfg = market_radar.INSTRUMENTS[inst]
+                        try:
+                            r = fh_limiter.get("https://finnhub.io/api/v1/quote",
+                                params={"symbol": cfg["symbol"], "token": FINNHUB_KEY}, timeout=5).json()
+                            c, dp = r.get("c"), r.get("dp")
+                            if c:
+                                parts_r.append(f"{inst}: <b>{c:.2f}</b> ({dp:+.1f}%)" if dp else f"{inst}: <b>{c:.2f}</b>")
+                        except Exception:
+                            pass
+                    bf = brent_radar._brent_fiyat_cek()
+                    if bf:
+                        parts_r.append(f"Brent: <b>{bf:.2f}</b>")
+                    await bot.send_message(chat_id=chat_id, parse_mode=ParseMode.HTML,
+                        text=f"<b>CANLI RADAR</b>\n\n" + "\n".join(parts_r) + f"\n\n{ist_now().strftime('%H:%M:%S')}")
+                    continue
+
+                # /watch
+                elif txt.startswith("/watch") and not txt.startswith("/watchlist"):
+                    parts_w = txt.split()[1:]
+                    if parts_w:
+                        added = watchlist.add(parts_w)
+                        await bot.send_message(chat_id=chat_id, parse_mode=ParseMode.HTML,
+                            text=f"Eklendi: {', '.join(added) if added else 'zaten var'}")
+                    else:
+                        await bot.send_message(chat_id=chat_id, text="/watch THYAO GARAN")
+                    continue
+
+                # /unwatch
+                elif txt.startswith("/unwatch"):
+                    parts_w = txt.split()[1:]
+                    removed = watchlist.remove(parts_w)
+                    await bot.send_message(chat_id=chat_id, parse_mode=ParseMode.HTML,
+                        text=f"Cikarildi: {', '.join(removed) if removed else 'bulunamadi'}")
+                    continue
+
+                # /watchlist
+                elif txt.strip() == "/watchlist":
+                    wl = watchlist.liste()
+                    await bot.send_message(chat_id=chat_id, parse_mode=ParseMode.HTML,
+                        text=f"<b>Watchlist:</b> {', '.join(wl) if wl else 'Bos'}")
+                    continue
+
+                # /heat THYAO
+                elif txt.startswith("/heat"):
+                    parts_h = txt.split()
+                    ticker_h = parts_h[1].upper() if len(parts_h) > 1 else ""
+                    if not ticker_h:
+                        await bot.send_message(chat_id=chat_id, text="/heat THYAO")
+                        continue
+                    if not TWSCRAPE_AVAILABLE:
+                        await bot.send_message(chat_id=chat_id, text="twscrape hesap yok.")
+                        continue
+                    await bot.send_message(chat_id=chat_id, text=f"X taraniyor: {ticker_h}...")
+                    try:
+                        result = await x_sentiment.tek_ticker_heat(ticker_h)
+                        if result:
+                            yon_i = {"BULLISH": "📈", "BEARISH": "📉"}.get(result["yon"], "➡️")
+                            await bot.send_message(chat_id=chat_id, parse_mode=ParseMode.HTML, text=(
+                                f"🔥 <b>X HEAT — {ticker_h}</b>\n\n"
+                                f"Skor: <b>{result['skor']}/100</b> {yon_i}\n"
+                                f"{result['ozet']}\n"
+                                f"Analiz: {result['count']} tweet"
+                            ))
+                        else:
+                            await bot.send_message(chat_id=chat_id, text="X API baglantisi kurulamadi.")
+                    except Exception as e:
+                        await bot.send_message(chat_id=chat_id, text=f"Hata: {e}")
+                    continue
+
+            # --- CALLBACK (feedback butonlari) ---
+            cq = upd.callback_query
+            if not cq:
+                continue
+            await bot.answer_callback_query(callback_query_id=cq.id, text="Kaydedildi")
+            parts = cq.data.split("_")
+            if len(parts) == 3 and parts[0] == "fb":
+                fb_type  = parts[1]
+                haber_id = int(parts[2])
+                with db_connect() as con:
+                    con.execute(
+                        "UPDATE haberler SET feedback=? WHERE id=?", (fb_type, haber_id)
+                    )
+                log.info(f"Feedback {fb_type} -> haber #{haber_id}")
+    except Exception as e:
+        log.debug(f"feedback_kontrol: {e}")
+
 
 # FA botu ayri dosyada (fa_bot.py)
 
