@@ -95,10 +95,10 @@ CLAUDE_MODEL      = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-20250514")
 # ================================================================
 POLL_INTERVAL     = 12
 AI_INTERVAL       = 35
-MAX_GLOBAL        = 3
-MAX_TURKEY        = 8
+MAX_GLOBAL        = 5
+MAX_TURKEY        = 12
 TURKEY_THRESH     = 7
-GLOBAL_THRESH     = 7
+GLOBAL_THRESH     = 6
 NOVELTY_HOURS     = 24
 PRICE_INTERVAL    = 120   # Brent fiyat kontrolu her 2 dk
 MACRO_INTERVAL    = 60
@@ -416,19 +416,27 @@ class BotState:
         self.global_thresh    = GLOBAL_THRESH
 
     def dinamik_esik_guncelle(self, gonderilenler):
-        """Son 30dk'da skor>=8 yoksa esik dus, varsa yuksel"""
+        """Son 20dk'da haber yoksa esik dus"""
         if gonderilenler:
             self.son_yuksek_skor_zamani = ist_now()
             self.turkey_thresh = TURKEY_THRESH
             self.global_thresh = GLOBAL_THRESH
         else:
             dakika = (ist_now() - self.son_yuksek_skor_zamani).total_seconds() / 60
-            if dakika > 60:
-                self.turkey_thresh = max(6, TURKEY_THRESH - 2)
-                self.global_thresh = max(5, GLOBAL_THRESH - 2)
-            elif dakika > 30:
-                self.turkey_thresh = max(7, TURKEY_THRESH - 1)
-                self.global_thresh = max(6, GLOBAL_THRESH - 1)
+            if dakika > 45:
+                new_tr = max(5, TURKEY_THRESH - 2)
+                new_gl = max(4, GLOBAL_THRESH - 2)
+                if new_tr != self.turkey_thresh:
+                    log.info(f"Dinamik esik dustu: TR={new_tr} GL={new_gl} ({int(dakika)}dk sessiz)")
+                self.turkey_thresh = new_tr
+                self.global_thresh = new_gl
+            elif dakika > 20:
+                new_tr = max(6, TURKEY_THRESH - 1)
+                new_gl = max(5, GLOBAL_THRESH - 1)
+                if new_tr != self.turkey_thresh:
+                    log.info(f"Dinamik esik dustu: TR={new_tr} GL={new_gl} ({int(dakika)}dk sessiz)")
+                self.turkey_thresh = new_tr
+                self.global_thresh = new_gl
 
 state = BotState()
 
@@ -1487,7 +1495,15 @@ class MacroEngine:
                 params={"from": bugun, "to": yarin, "token": FINNHUB_KEY},
                 timeout=10
             ).json()
-            for ev in r.get("economicCalendar", []):
+            events = r.get("economicCalendar", [])
+            tr_us_events = [e for e in events if e.get("country") in ("TR", "US")]
+            if tr_us_events and state.dongu_sayac % 30 == 1:
+                # Her 30 dongude (6dk) event listesini logla
+                log.info(f"MacroEngine: {len(tr_us_events)} TR/US event bulundu")
+                for ev in tr_us_events[:5]:
+                    log.info(f"  → {ev.get('country')} | {ev.get('event','?')[:40]} | {ev.get('time','?')} | impact={ev.get('impact','?')} | actual={ev.get('actual','')}")
+
+            for ev in events:
                 country    = ev.get("country", "")
                 impact     = ev.get("impact", "")
                 event_name = ev.get("event", "")
@@ -2140,32 +2156,31 @@ def claude_skore_et(haberler, mod):
         if mod == "global":
             prompt = (
                 f"Sen BIST/VIOP uzmani Turk trader. Global haberleri BIST etkisi ile skorla.\n"
-                f"Kaynak kalitesi: T1=FED/ECB/Reuters/AP, T2=FT/WSJ/Axios/Politico/Bloomberg, T3=diger\n\n"
-                f"KRITIK SORU: Bu haber BIST'te BUGUN trade edilebilir mi?\n\n"
-                f"PUANLAMA:\n"
-                f"9-10 = Aninda etki: Fed acil toplanti, buyuk savas, Hurmuz kapaniyor, nukleer kriz\n"
-                f"8    = Bugun trade edilir: Fed/ECB surpriz karar, petrol %2+, Iran/Rusya yaptirimi, NATO krizi\n"
-                f"7    = Takip edilir: Onemli veri surprizi, jeopolitik gerilim, EM sell-off\n"
-                f"4-6  = Zayif etki: Beklenen veri, kucuk gelisme\n"
-                f"0-3  = BIST ile ilgisi yok: Yerel politika, magazin, spor\n\n"
-                f"T1 kaynak +1, T3 kaynak -1. Petrol/Hurmuz/Iran/OPEC haberleri dikkat.\n\n"
+                f"Kaynak: T1=FED/ECB/Reuters/AP, T2=FT/WSJ/Axios/Politico/Bloomberg, T3=diger\n\n"
+                f"PUANLAMA — CÖMERT OL, bir trader bu haberi bilmeli mi?\n"
+                f"9-10 = Acil: Fed acil toplanti, savas, Hurmuz kapaniyor\n"
+                f"7-8  = Onemli: Merkez bankasi karari, petrol sert hareket, jeopolitik kriz, onemli veri\n"
+                f"6    = Takip: Veri aciklamasi, sektor haberi, EM geneli etkileyen gelisme\n"
+                f"4-5  = Zayif: Beklenen veri, kucuk gelisme\n"
+                f"0-3  = Alakasiz: Magazin, spor, yerel politika\n\n"
+                f"ONEMLI: Petrol/enerji/Hurmuz/Iran haberleri minimum 7.\n"
+                f"Merkez bankasi haberleri minimum 7. EM/gelisen piyasa haberleri minimum 6.\n\n"
                 f"SADECE JSON:\n"
-                f'[{{"id":1,"skor":9,"yon":"BEARISH","semboller":["TUPRS","PETKM"],"ozet":"max 10 kelime Turkce"}}]\n\n'
+                f'[{{"id":1,"skor":8,"yon":"BEARISH","semboller":["TUPRS"],"ozet":"max 10 kelime Turkce"}}]\n\n'
                 f"Haberler:\n{liste}"
             )
         else:
             prompt = (
                 f"Sen BIST/VIOP uzmani Turk trader. Turkiye haberlerini skorla.\n"
                 f"BIST30: {', '.join(BIST30)}\n"
-                f"[SEMBOL] ile baslayanlar = KAP/sirket haberi — otomatik +1 puan.\n"
-                f"T1 kaynak (TCMB/SPK/BDDK/AA/Bloomberg HT) +1, diger medya -1.\n\n"
-                f"KRITIK SORU: Bu haber BIST'te BUGUN trade edilebilir mi?\n\n"
-                f"PUANLAMA:\n"
-                f"9-10 = Aninda: TCMB surpriz faiz, TL krizi, yaptirimi, buyuk deprem, KAP sermaye artirimi\n"
-                f"8    = Bugun trade edilir: BIST30 KAP karari, TUFE/buyume surprizi, BDDK karari, temettü\n"
-                f"7    = Takip: Sektor haberi, orta sirket, ekonomi yorumu\n"
-                f"4-6  = Zayif: Kucuk sirket, rutin aciklama\n"
-                f"0-3  = GURULTU: Siyaset, spor, magazin, tahmin/yorum\n\n"
+                f"[SEMBOL] ile baslayanlar = sirket haberi — minimum 7 puan.\n\n"
+                f"PUANLAMA — CÖMERT OL, bir BIST traderi bu haberi bilmeli mi?\n"
+                f"9-10 = Acil: TCMB surpriz, TL krizi, buyuk deprem, KAP sermaye artirimi\n"
+                f"7-8  = Onemli: KAP karari, TUFE/buyume, BDDK, temettu, sektor gelismesi\n"
+                f"6    = Takip: Ekonomi yorumu, orta sirket haberi, sanayi verisi\n"
+                f"4-5  = Zayif: Kucuk sirket, rutin aciklama\n"
+                f"0-3  = Gurultu: Siyaset dedikodu, spor, magazin\n\n"
+                f"ONEMLI: Sirket haberleri ([SEMBOL]) minimum 7. Ekonomi verisi minimum 6.\n\n"
                 f"SADECE JSON:\n"
                 f'[{{"id":1,"skor":8,"yon":"BULLISH","semboller":["THYAO"],"ozet":"max 10 kelime Turkce"}}]\n\n'
                 f"Haberler:\n{liste}"
