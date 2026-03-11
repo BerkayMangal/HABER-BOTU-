@@ -1,6 +1,6 @@
 # ================================================================
-# BERKAY TERMINATOR v3.2 — RAILWAY
-# v3.1 fixes + Calendar Overhaul + FA Speed + Timezone + ML Persist
+# BERKAY TERMINATOR v3.3 — RAILWAY
+# v3.2 fixes + Radar + Watchlist + Dynamic Thresh + FA PreCache
 # ================================================================
 #
 # v3.2 YENILIKLER:
@@ -398,6 +398,355 @@ class FinnhubLimiter:
 
 fh_limiter = FinnhubLimiter()
 
+# ================================================================
+# BOT STATE — global degiskenler yerine tek class
+# ================================================================
+class BotState:
+    def __init__(self):
+        self.bekl_global      = []
+        self.bekl_turkey      = []
+        self.son_ai           = 0.0
+        self.son_brent_fiyat  = 0.0
+        self.son_brent_teknik = 0.0
+        self.son_macro        = 0.0
+        self.son_ml_guncelle  = 0.0
+        self.son_feedback     = 0.0
+        self.son_durum        = ist_now()
+        self.son_sabah        = None
+        self.son_oglen        = None
+        self.son_aksam        = None
+        self.son_fa_precache  = 0.0
+        self.son_radar        = 0.0
+        self.dongu_sayac      = 0
+        self.toplam_gonderilen = 0
+        self.baslangic        = ist_now()
+        self.telegram_kuyruk  = []
+        # Dynamic threshold
+        self.son_yuksek_skor_zamani = ist_now()
+        self.turkey_thresh    = TURKEY_THRESH
+        self.global_thresh    = GLOBAL_THRESH
+
+    def dinamik_esik_guncelle(self, gonderilenler):
+        """Son 30dk'da skor>=8 yoksa esik dus, varsa yuksel"""
+        if gonderilenler:
+            self.son_yuksek_skor_zamani = ist_now()
+            self.turkey_thresh = TURKEY_THRESH
+            self.global_thresh = GLOBAL_THRESH
+        else:
+            dakika = (ist_now() - self.son_yuksek_skor_zamani).total_seconds() / 60
+            if dakika > 60:
+                self.turkey_thresh = max(6, TURKEY_THRESH - 2)
+                self.global_thresh = max(5, GLOBAL_THRESH - 2)
+            elif dakika > 30:
+                self.turkey_thresh = max(7, TURKEY_THRESH - 1)
+                self.global_thresh = max(6, GLOBAL_THRESH - 1)
+
+state = BotState()
+
+# ================================================================
+# WATCHLIST — /watch THYAO GARAN, /unwatch THYAO, /watchlist
+# ================================================================
+class Watchlist:
+    def __init__(self):
+        self._load()
+
+    def _load(self):
+        try:
+            with db_connect() as con:
+                con.execute("""
+                    CREATE TABLE IF NOT EXISTS watchlist (
+                        ticker TEXT PRIMARY KEY
+                    )
+                """)
+                rows = con.execute("SELECT ticker FROM watchlist").fetchall()
+            self.tickers = {r[0] for r in rows}
+        except Exception:
+            self.tickers = set()
+
+    def add(self, tickers):
+        added = []
+        for t in tickers:
+            t = t.upper().replace(".IS","")
+            if t and t not in self.tickers:
+                self.tickers.add(t)
+                try:
+                    with db_connect() as con:
+                        con.execute("INSERT OR IGNORE INTO watchlist (ticker) VALUES (?)", (t,))
+                except Exception:
+                    pass
+                added.append(t)
+        return added
+
+    def remove(self, tickers):
+        removed = []
+        for t in tickers:
+            t = t.upper().replace(".IS","")
+            if t in self.tickers:
+                self.tickers.discard(t)
+                try:
+                    with db_connect() as con:
+                        con.execute("DELETE FROM watchlist WHERE ticker=?", (t,))
+                except Exception:
+                    pass
+                removed.append(t)
+        return removed
+
+    def liste(self):
+        return sorted(self.tickers)
+
+    def haberde_var_mi(self, semboller):
+        """Watchlist hissesi haberde geciyorsa True"""
+        return bool(self.tickers & set(semboller))
+
+watchlist = Watchlist()
+
+# ================================================================
+# MARKET RADAR — DXY, US10Y, VIX, XU030 + Brent (mevcut)
+# ================================================================
+class MarketRadar:
+    """DXY/VIX/US10Y/XU030 icin Brent-tarzi alarm sistemi"""
+
+    INSTRUMENTS = {
+        "DXY":   {"symbol": "OANDA:SPX500USD", "finnhub": True, "esik_sari": 0.5, "esik_kirmizi": 1.0,
+                   "label": "DOLAR ENDEKSI", "etki": "TL, bankalar, EM geneli"},
+        "VIX":   {"symbol": "CBOE:VIX",        "finnhub": True, "esik_sari": 5.0, "esik_kirmizi": 10.0,
+                   "label": "KORKU ENDEKSI",  "etki": "Risk-off, BIST geneli"},
+        "XU030": {"symbol": "XIST:XU030",      "finnhub": True, "esik_sari": 1.0, "esik_kirmizi": 2.0,
+                   "label": "BIST30",          "etki": "Endeks geneli"},
+        "USDTRY":{"symbol": "OANDA:USDTRY",    "finnhub": True, "esik_sari": 0.5, "esik_kirmizi": 1.0,
+                   "label": "USD/TRY",         "etki": "TL, ithalat/ihracat"},
+    }
+
+    def __init__(self):
+        self.baz = {}  # instrument -> baz fiyat
+
+    def _fiyat_cek(self, inst):
+        cfg = self.INSTRUMENTS[inst]
+        if cfg["finnhub"]:
+            try:
+                r = fh_limiter.get(
+                    "https://finnhub.io/api/v1/quote",
+                    params={"symbol": cfg["symbol"], "token": FINNHUB_KEY},
+                    timeout=7
+                ).json()
+                return r.get("c")  # current price
+            except Exception:
+                return None
+        return None
+
+    def kontrol(self):
+        """Tum enstrumanlari kontrol et, alarm listesi don"""
+        alarms = []
+        for inst, cfg in self.INSTRUMENTS.items():
+            fiyat = self._fiyat_cek(inst)
+            if not fiyat:
+                continue
+            if inst not in self.baz:
+                self.baz[inst] = fiyat
+                continue
+            degisim = (fiyat - self.baz[inst]) / self.baz[inst] * 100
+            abs_deg = abs(degisim)
+            if abs_deg >= cfg["esik_kirmizi"]:
+                yon = "📈" if degisim > 0 else "📉"
+                alarms.append((inst, cfg, fiyat, self.baz[inst], degisim, "🔴", yon))
+                self.baz[inst] = fiyat
+            elif abs_deg >= cfg["esik_sari"]:
+                yon = "📈" if degisim > 0 else "📉"
+                alarms.append((inst, cfg, fiyat, self.baz[inst], degisim, "🟡", yon))
+                self.baz[inst] = fiyat
+        return alarms
+
+    def alarm_mesaj(self, inst, cfg, fiyat, baz, degisim, seviye, yon):
+        return (
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"{seviye} <b>{cfg['label']} HAREKET</b> {yon}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"{baz:.2f}  →  <b>{fiyat:.2f}</b>\n"
+            f"Hareket: {yon} <b>%{abs(degisim):.2f}</b>\n\n"
+            f"Etki: {cfg['etki']}\n"
+            f"⏰ {ist_now().strftime('%H:%M:%S')}"
+        )
+
+    def market_context_line(self):
+        """Mesajlara eklenecek 1 satirlik piyasa ozeti"""
+        parts = []
+        for inst in ["XU030", "USDTRY"]:
+            cfg = self.INSTRUMENTS[inst]
+            try:
+                r = fh_limiter.get(
+                    "https://finnhub.io/api/v1/quote",
+                    params={"symbol": cfg["symbol"], "token": FINNHUB_KEY},
+                    timeout=5
+                ).json()
+                dp = r.get("dp")
+                if dp is not None:
+                    parts.append(f"{inst} {dp:+.1f}%")
+            except Exception:
+                pass
+        # Brent
+        bf = brent_radar._brent_fiyat_cek()
+        if bf:
+            parts.append(f"Brent {bf:.1f}")
+        return "  ·  ".join(parts) if parts else ""
+
+market_radar = MarketRadar()
+
+# ================================================================
+# X SENTIMENT ENGINE (Twitter Heat) — twscrape ile
+# ================================================================
+try:
+    from twscrape import API as TwAPI, gather as tw_gather
+    TWSCRAPE_AVAILABLE = True
+except ImportError:
+    TWSCRAPE_AVAILABLE = False
+
+class XSentimentEngine:
+    def __init__(self):
+        self.api = None
+        self.last_scan = 0
+        self.SCAN_INTERVAL = 180          # 3 dakika
+        self.HEAT_THRESHOLD = 75          # %75 ustu alarm
+        self.TWEET_LIMIT = 35
+        self.heat_cache = {}              # ticker -> (skor, timestamp)
+
+        self.TICKER_QUERIES = {
+            "THYAO": "THYAO OR thy hava yollari",
+            "GARAN": "GARAN OR garanti bbva",
+            "AKBNK": "AKBNK OR akbank",
+            "TUPRS": "TUPRS OR tupras",
+            "ASELS": "ASELS OR aselsan",
+            "KOZAL": "KOZAL OR koza altin",
+            "EREGL": "EREGL OR eregli demir",
+            "ISCTR": "ISCTR OR is bankasi",
+            "YKBNK": "YKBNK OR yapi kredi",
+            "KCHOL": "KCHOL OR koc holding",
+            "SAHOL": "SAHOL OR sabanci",
+            "PGSUS": "PGSUS OR pegasus",
+            "TCELL": "TCELL OR turkcell",
+            "FROTO": "FROTO OR ford otosan",
+            "SISE":  "SISE OR sisecam",
+            "BIMAS": "BIMAS OR bim market",
+            "PETKM": "PETKM OR petkim",
+        }
+        for t in BIST30:
+            if t not in self.TICKER_QUERIES:
+                self.TICKER_QUERIES[t] = t
+
+    async def init_api(self):
+        if not TWSCRAPE_AVAILABLE:
+            return False
+        if self.api is None:
+            try:
+                self.api = TwAPI()
+                await self.api.pool.login_all()
+                log.info("twscrape API baslatildi — X Sentiment aktif!")
+                return True
+            except Exception as e:
+                log.warning(f"twscrape init: {e}")
+                self.api = None
+                return False
+        return True
+
+    async def heat_kontrol(self, bot):
+        if time.time() - self.last_scan < self.SCAN_INTERVAL:
+            return
+        ok = await self.init_api()
+        if not ok:
+            return
+        self.last_scan = time.time()
+
+        # Her seferde 8 ticker tara (rate limit korumasi)
+        tickers = list(self.TICKER_QUERIES.keys())
+        # Watchlist oncelikli
+        wl = watchlist.liste()
+        priority = [t for t in wl if t in self.TICKER_QUERIES]
+        others   = [t for t in tickers if t not in priority]
+        scan_list = (priority + others)[:8]
+
+        for ticker in scan_list:
+            query = self.TICKER_QUERIES[ticker]
+            try:
+                tweets = await tw_gather(self.api.search(query, limit=self.TWEET_LIMIT))
+                if len(tweets) < 5:
+                    continue
+                tweet_texts = [t.rawContent for t in tweets if not t.rawContent.startswith("RT @")]
+                if len(tweet_texts) < 3:
+                    continue
+                text_combined = "\n".join(tweet_texts[:20])
+                skor, yon, ozet = await self._claude_heat(ticker, text_combined, len(tweet_texts))
+                self.heat_cache[ticker] = (skor, yon, ozet, time.time())
+                if skor >= self.HEAT_THRESHOLD:
+                    await self._alarm_gonder(bot, ticker, skor, yon, ozet, len(tweet_texts))
+                await asyncio.sleep(1.5)
+            except Exception as e:
+                log.debug(f"X heat {ticker}: {e}")
+
+    async def _claude_heat(self, ticker, tweets_text, count):
+        try:
+            client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+            prompt = (
+                f"Sen BIST traderisin. Son {count} tweet'i analiz et.\n"
+                f"Hisse: {ticker}\n\nTweetler:\n{tweets_text[:3000]}\n\n"
+                f"0-100 arasi HEAT SKORU ver:\n"
+                f"90+ = Cilgin ates (short squeeze, pump)\n"
+                f"75-89 = Guclu pozitif momentum\n"
+                f"60-74 = Normal konusuluyor\n"
+                f"40-59 = Soguk\n"
+                f"<40 = Negatif baski\n\n"
+                f"SADECE JSON:\n"
+                f'{{"skor":87,"yon":"BULLISH","ozet":"max 12 kelime Turkce"}}'
+            )
+            msg = client.messages.create(
+                model=CLAUDE_MODEL, max_tokens=200,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            text = msg.content[0].text.strip()
+            if not text.startswith("{"):
+                m = re.search(r'\{.*\}', text, re.DOTALL)
+                text = m.group(0) if m else '{"skor":50,"yon":"NOTR","ozet":""}'
+            data = json.loads(text)
+            return int(data.get("skor", 50)), data.get("yon", "NOTR"), data.get("ozet", "")
+        except Exception:
+            return 40, "NOTR", ""
+
+    async def _alarm_gonder(self, bot, ticker, skor, yon, ozet, tweet_sayisi):
+        yon_icon = {"BULLISH": "📈", "BEARISH": "📉"}.get(yon, "➡️")
+        seviye = "CILGIN ATES" if skor >= 90 else "GUCLU MOMENTUM"
+        msg = (
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🔥 <b>X HEAT — {seviye}</b> {yon_icon}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"<b>{ticker}</b>  —  <b>{skor}/100</b>\n\n"
+            f"{ozet}\n"
+            f"Son {tweet_sayisi} tweet analiz edildi\n\n"
+            f"⏰ {ist_now().strftime('%H:%M:%S')}"
+        )
+        try:
+            await bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode=ParseMode.HTML)
+            log.info(f"X HEAT: {ticker} ({skor}) {yon}")
+        except Exception as e:
+            log.error(f"X alarm: {e}")
+
+    async def tek_ticker_heat(self, ticker):
+        """Tek ticker icin heat skoru — /heat komutu"""
+        ok = await self.init_api()
+        if not ok:
+            return None
+        ticker = ticker.upper().replace(".IS","")
+        query = self.TICKER_QUERIES.get(ticker, ticker)
+        try:
+            tweets = await tw_gather(self.api.search(query, limit=30))
+            tweet_texts = [t.rawContent for t in tweets if not t.rawContent.startswith("RT @")]
+            if len(tweet_texts) < 3:
+                return {"skor": 0, "yon": "NOTR", "ozet": "Yeterli tweet yok", "count": len(tweet_texts)}
+            text_combined = "\n".join(tweet_texts[:20])
+            skor, yon, ozet = await self._claude_heat(ticker, text_combined, len(tweet_texts))
+            return {"skor": skor, "yon": yon, "ozet": ozet, "count": len(tweet_texts)}
+        except Exception as e:
+            return {"skor": 0, "yon": "NOTR", "ozet": str(e), "count": 0}
+
+x_sentiment = XSentimentEngine()
+
 def db_init():
     with db_connect() as con:
         con.executescript("""
@@ -620,11 +969,24 @@ def fa_fetch_raw(symbol):
         info = tk.get_info() or {}
         try: fast = getattr(tk,"fast_info",{}) or {}
         except Exception: fast = {}
+        # yfinance v0.2.40+ deprecated property'ler icin fallback
+        try:
+            financials = tk.get_financials()
+        except Exception:
+            financials = tk.financials
+        try:
+            balance = tk.get_balance_sheet()
+        except Exception:
+            balance = tk.balance_sheet
+        try:
+            cashflow = tk.get_cashflow()
+        except Exception:
+            cashflow = tk.cashflow
         raw = {
             "info": info, "fast": fast,
-            "financials": tk.financials,
-            "balance": tk.balance_sheet,
-            "cashflow": tk.cashflow,
+            "financials": financials,
+            "balance": balance,
+            "cashflow": cashflow,
         }
         FA_RAW_CACHE[symbol] = raw
         return raw
@@ -1062,15 +1424,122 @@ async def feedback_kontrol(bot):
                 # /help
                 elif txt.strip() == "/help":
                     await bot.send_message(chat_id=chat_id, parse_mode=ParseMode.HTML, text=(
-                        "<b>BERKAY TERMINATOR v3.2 KOMUTLAR</b>\n\n"
+                        "<b>BERKAY TERMINATOR v3.3</b>\n\n"
                         "<b>Temel Analiz:</b>\n"
-                        "TCELL — sadece ticker yaz, analiz gelir\n"
+                        "TCELL — ticker yaz, analiz gelir\n"
                         "/analiz THYAO — ayni sey\n"
-                        "/top10 — BIST Top 10 tarama\n\n"
-                        "<b>Haber Botu:</b>\n"
-                        "Otomatik calisiyor, haber gelince mesaj atar.\n"
-                        "Geri bildirim butonlari (Iyi/Gurultu/Gec kaldi)"
+                        "/top10 — BIST en iyi 10\n\n"
+                        "<b>Piyasa:</b>\n"
+                        "/radar — canli fiyatlar\n"
+                        "/heat THYAO — X heat skoru\n"
+                        "/durum — sistem durumu\n\n"
+                        "<b>Watchlist:</b>\n"
+                        "/watch THYAO GARAN — ekle\n"
+                        "/unwatch THYAO — cikar\n"
+                        "/watchlist — listeyi gor\n\n"
+                        "<b>Otomatik:</b>\n"
+                        "Haberler, Brent/DXY/VIX alarm,\n"
+                        "X Sentiment, Macro takvim,\n"
+                        "09:45 / 13:00 / 17:45 raporlar"
                     ))
+                    continue
+
+                # /durum — sistem durumu
+                elif txt.strip() == "/durum" or txt.strip() == "/status":
+                    try:
+                        with db_connect() as con:
+                            tk  = con.execute("SELECT COUNT(*) FROM haberler").fetchone()[0]
+                            mlv = con.execute("SELECT COUNT(*) FROM haberler WHERE relative_move IS NOT NULL").fetchone()[0]
+                            fbc = con.execute("SELECT COUNT(*) FROM haberler WHERE feedback IS NOT NULL").fetchone()[0]
+                    except Exception:
+                        tk, mlv, fbc = 0, 0, 0
+                    uptime_h = int((ist_now() - state.baslangic).total_seconds() // 3600)
+                    brent_su = brent_radar._brent_fiyat_cek()
+                    await bot.send_message(chat_id=chat_id, parse_mode=ParseMode.HTML, text=(
+                        f"<b>SISTEM DURUMU</b>\n\n"
+                        f"Calisma: {uptime_h} saat\n"
+                        f"Gonderilen: {state.toplam_gonderilen} haber\n"
+                        f"DB: {tk} kayit | ML verisi: {mlv}/{ml.MIN_VERI}\n"
+                        f"ML: {'Aktif' if ml.trained else 'Birikim'} | Feedback: {fbc}\n"
+                        f"TR Esik: {state.turkey_thresh} | GL Esik: {state.global_thresh}\n"
+                        f"Brent: {brent_su:.2f if brent_su else '—'}\n"
+                        f"Watchlist: {', '.join(watchlist.liste()) or '—'}\n"
+                        f"Son dongu: #{state.dongu_sayac}\n"
+                        f"{ist_now().strftime('%d.%m.%Y %H:%M')}"
+                    ))
+                    continue
+
+                # /radar — canli piyasa
+                elif txt.strip() == "/radar":
+                    parts_r = []
+                    for inst in ["XU030", "USDTRY"]:
+                        cfg = market_radar.INSTRUMENTS[inst]
+                        try:
+                            r = fh_limiter.get("https://finnhub.io/api/v1/quote",
+                                params={"symbol": cfg["symbol"], "token": FINNHUB_KEY}, timeout=5).json()
+                            c, dp = r.get("c"), r.get("dp")
+                            if c:
+                                parts_r.append(f"{inst}: <b>{c:.2f}</b> ({dp:+.1f}%)" if dp else f"{inst}: <b>{c:.2f}</b>")
+                        except Exception:
+                            pass
+                    bf = brent_radar._brent_fiyat_cek()
+                    if bf:
+                        parts_r.append(f"Brent: <b>{bf:.2f}</b>")
+                    await bot.send_message(chat_id=chat_id, parse_mode=ParseMode.HTML,
+                        text=f"<b>CANLI RADAR</b>\n\n" + "\n".join(parts_r) + f"\n\n⏰ {ist_now().strftime('%H:%M:%S')}")
+                    continue
+
+                # /watch THYAO GARAN
+                elif txt.startswith("/watch") and not txt.startswith("/watchlist"):
+                    parts_w = txt.split()[1:]
+                    if parts_w:
+                        added = watchlist.add(parts_w)
+                        await bot.send_message(chat_id=chat_id, parse_mode=ParseMode.HTML,
+                            text=f"Eklendi: {', '.join(added) if added else 'zaten var'}")
+                    else:
+                        await bot.send_message(chat_id=chat_id, text="/watch THYAO GARAN")
+                    continue
+
+                # /unwatch THYAO
+                elif txt.startswith("/unwatch"):
+                    parts_w = txt.split()[1:]
+                    removed = watchlist.remove(parts_w)
+                    await bot.send_message(chat_id=chat_id, parse_mode=ParseMode.HTML,
+                        text=f"Cikarildi: {', '.join(removed) if removed else 'bulunamadi'}")
+                    continue
+
+                # /watchlist
+                elif txt.strip() == "/watchlist":
+                    wl = watchlist.liste()
+                    await bot.send_message(chat_id=chat_id, parse_mode=ParseMode.HTML,
+                        text=f"<b>Watchlist:</b> {', '.join(wl) if wl else 'Bos'}")
+                    continue
+
+                # /heat THYAO — anlik X sentiment
+                elif txt.startswith("/heat"):
+                    parts_h = txt.split()
+                    ticker_h = parts_h[1].upper() if len(parts_h) > 1 else ""
+                    if not ticker_h:
+                        await bot.send_message(chat_id=chat_id, text="/heat THYAO")
+                        continue
+                    if not TWSCRAPE_AVAILABLE:
+                        await bot.send_message(chat_id=chat_id, text="twscrape yuklu degil. pip install twscrape")
+                        continue
+                    await bot.send_message(chat_id=chat_id, text=f"X taraniyor: {ticker_h}...")
+                    try:
+                        result = await x_sentiment.tek_ticker_heat(ticker_h)
+                        if result:
+                            yon_i = {"BULLISH": "📈", "BEARISH": "📉"}.get(result["yon"], "➡️")
+                            await bot.send_message(chat_id=chat_id, parse_mode=ParseMode.HTML, text=(
+                                f"🔥 <b>X HEAT — {ticker_h}</b>\n\n"
+                                f"Skor: <b>{result['skor']}/100</b> {yon_i}\n"
+                                f"{result['ozet']}\n"
+                                f"Analiz: {result['count']} tweet"
+                            ))
+                        else:
+                            await bot.send_message(chat_id=chat_id, text="X API baglantisi kurulamadi.")
+                    except Exception as e:
+                        await bot.send_message(chat_id=chat_id, text=f"Hata: {e}")
                     continue
 
             # --- CALLBACK SORGULARI ---
@@ -1699,8 +2168,26 @@ class MacroEngine:
         (11, 3, 10, 0, "Turkey CPI"), (12, 3, 10, 0, "Turkey CPI"),
     ]
     TR_HARDCODED_2026 = [
-        # 2026 tarihleri TCMB aciklayinca guncelle
-        # Su an icin ayni pattern devam
+        # 2026 TCMB PPK — 2025 patterninden (3. Persembe) tahmini
+        (1, 22, 14, 0, "Turkey Interest Rate"),
+        (2, 19, 14, 0, "Turkey Interest Rate"),
+        (3, 19, 14, 0, "Turkey Interest Rate"),
+        (4, 16, 14, 0, "Turkey Interest Rate"),
+        (5, 21, 14, 0, "Turkey Interest Rate"),
+        (6, 18, 14, 0, "Turkey Interest Rate"),
+        (7, 23, 14, 0, "Turkey Interest Rate"),
+        (8, 20, 14, 0, "Turkey Interest Rate"),
+        (9, 17, 14, 0, "Turkey Interest Rate"),
+        (10, 22, 14, 0, "Turkey Interest Rate"),
+        (11, 19, 14, 0, "Turkey Interest Rate"),
+        (12, 24, 14, 0, "Turkey Interest Rate"),
+        # TUFE — ayin 3-5'i arasi 10:00
+        (1, 5, 10, 0, "Turkey CPI"), (2, 3, 10, 0, "Turkey CPI"),
+        (3, 3, 10, 0, "Turkey CPI"), (4, 3, 10, 0, "Turkey CPI"),
+        (5, 4, 10, 0, "Turkey CPI"), (6, 3, 10, 0, "Turkey CPI"),
+        (7, 3, 10, 0, "Turkey CPI"), (8, 3, 10, 0, "Turkey CPI"),
+        (9, 3, 10, 0, "Turkey CPI"), (10, 5, 10, 0, "Turkey CPI"),
+        (11, 3, 10, 0, "Turkey CPI"), (12, 3, 10, 0, "Turkey CPI"),
     ]
 
     async def _hardcoded_tr_kontrol(self, bot):
@@ -2103,11 +2590,11 @@ def yeni_h(kaynak, baslik, url, tip="rss"):
         "surprise":        None,
     }
 
-def rss_cek(feeds):
+def rss_cek(feeds, max_age_hours=4):
+    """RSS cek. max_age_hours: TR=12, Global=4 (dedup zaten var, age filtre gevsetildi)"""
     out = []
     for kaynak, url in feeds:
         try:
-            # requests ile timeout kontrollu fetch, sonra feedparser'a ver
             resp = requests.get(url, headers=HEADERS, timeout=10)
             feed = feedparser.parse(resp.text)
             for e in feed.entries[:6]:
@@ -2118,7 +2605,7 @@ def rss_cek(feeds):
                 if published:
                     try:
                         age_hours = (time.time() - time.mktime(published)) / 3600
-                        if age_hours > 2:
+                        if age_hours > max_age_hours:
                             continue
                     except Exception:
                         pass
@@ -2263,10 +2750,15 @@ def claude_skore_et(haberler, mod):
             messages=[{"role": "user", "content": prompt}]
         )
         text = msg.content[0].text.strip()
-        # JSON array'i cikart (markdown fence veya preamble olabilir)
-        if not text.startswith("["):
-            m    = re.search(r'\[.*\]', text, re.DOTALL)
-            text = m.group(0) if m else "[]"
+        # JSON array'i cikart — daha robust parsing
+        try:
+            if not text.startswith("["):
+                m = re.search(r'\[\s*\{.*?\}\s*\]', text, re.DOTALL)
+                text = m.group(0) if m else "[]"
+            json.loads(text)  # validate
+        except (json.JSONDecodeError, AttributeError):
+            log.warning(f"Claude JSON parse hatasi, fallback 0 skor")
+            text = "[]"
 
         for s in json.loads(text):
             idx = s.get("id", 0) - 1
@@ -2390,6 +2882,11 @@ def mesaj_olustur(h, mod, acil=False):
     if h.get("url"):
         safe_url = html_escape(h['url'])
         msg += f"\n<a href='{safe_url}'>Habere Git</a>"
+    # Market context — sadece onemli haberlerde (rate limit koruma)
+    if skor >= 7:
+        ctx = market_radar.market_context_line()
+        if ctx:
+            msg += f"\n\n<i>{ctx}</i>"
     return msg
 
 # ================================================================
@@ -2553,31 +3050,77 @@ async def aksam_ozeti(bot):
         log.warning(f"aksam_ozeti: {e}")
 
 # ================================================================
+# OGLEN BRIFING (13:00)
+# ================================================================
+async def oglen_brifing(bot):
+    try:
+        client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+        sinir  = ist_now().replace(hour=9, minute=0, second=0).isoformat()
+        with db_connect() as con:
+            rows = con.execute("""
+                SELECT baslik, ai_skor, yon, semboller, stream
+                FROM haberler WHERE gonderildi=1 AND timestamp > ?
+                ORDER BY ai_skor DESC LIMIT 10
+            """, (sinir,)).fetchall()
+        if not rows:
+            return
+        liste = "\n".join([f"- [{r[1]}/10] [{r[4]}] {r[0][:80]}" for r in rows[:8]])
+        ctx = market_radar.market_context_line()
+        prompt = (
+            f"Sen BIST/VIOP uzmani. Oglen 13:00 ara rapor. Turkce, max 10 satir.\n"
+            f"SABAHTAN BU YANA:\n{liste}\n\nPIYASA: {ctx}\n\n"
+            f"Yaz: En sicak 5 hisse + neden. Ogleden sonra dikkat edilecekler."
+        )
+        msg = client.messages.create(
+            model=CLAUDE_MODEL, max_tokens=500,
+            messages=[{"role":"user","content":prompt}]
+        )
+        await bot.send_message(
+            chat_id=CHAT_ID,
+            text=(
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"☀️ <b>OGLEN RAPORU</b>  —  {ist_now().strftime('%d.%m.%Y %H:%M')}\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"{msg.content[0].text.strip()}"
+            ),
+            parse_mode=ParseMode.HTML
+        )
+        log.info("Oglen brifing gonderildi")
+    except Exception as e:
+        log.warning(f"oglen_brifing: {e}")
+
+# ================================================================
+# FA PRE-CACHE — arka planda tum universe'u tara
+# ================================================================
+def fa_precache_all():
+    """Tum FA_UNIVERSE'u background'da cache'le"""
+    if not FA_AVAILABLE:
+        return
+    cached = 0
+    for t in FA_UNIVERSE:
+        try:
+            fa_analyze(fa_normalize(t))
+            cached += 1
+        except Exception:
+            pass
+    log.info(f"FA pre-cache: {cached}/{len(FA_UNIVERSE)} hisse")
+
+# ================================================================
+# FEEDBACK LONG-POLL TASK — ayri task, surekli dinle
+# ================================================================
+async def feedback_loop(bot):
+    """Ayri async task: telegram updates'i surekli dinle, butonlar aninda cevap versin"""
+    while True:
+        try:
+            await feedback_kontrol(bot)
+        except Exception as e:
+            log.debug(f"feedback_loop: {e}")
+        await asyncio.sleep(2)  # 2 saniyede bir kontrol (onceki 60sn idi!)
+
+# ================================================================
 # ANA DONGU
 # ================================================================
-bekl_global         = []
-bekl_turkey         = []
-son_ai              = 0.0
-son_brent_fiyat     = 0.0
-son_brent_teknik    = 0.0
-son_macro           = 0.0
-son_ml_guncelle     = 0.0
-son_feedback        = 0.0
-son_durum           = ist_now()
-son_sabah_brifing   = None
-son_aksam_ozeti     = None
-dongu_sayac         = 0
-toplam_gonderilen   = 0
-baslangic           = ist_now()
-telegram_kuyruk     = []
-
 async def ana_dongu():
-    global bekl_global, bekl_turkey, son_ai
-    global son_brent_fiyat, son_brent_teknik, son_macro
-    global son_ml_guncelle, son_feedback, son_durum
-    global dongu_sayac, toplam_gonderilen, telegram_kuyruk
-    global son_sabah_brifing, son_aksam_ozeti
-
     db_init()
     dedup_yukle()
     bot            = Bot(token=TELEGRAM_TOKEN)
@@ -2602,7 +3145,7 @@ async def ana_dongu():
                         b, um.group(0) if um else "", "telegram"
                     )
                     h["semboller"] = nov.entity_bul(b)
-                    telegram_kuyruk.append(h)
+                    state.telegram_kuyruk.append(h)
         except Exception as e:
             log.warning(f"Telethon: {e}")
 
@@ -2610,55 +3153,76 @@ async def ana_dongu():
         chat_id=CHAT_ID,
         text=(
             "━━━━━━━━━━━━━━━━━━━━━━\n"
-            "<b>BERKAY TERMINATOR v3.2</b>\n"
-            f"{ist_now().strftime('%d.%m.%Y %H:%M')} (Istanbul)\n"
+            "🤖 <b>BERKAY TERMINATOR v3.3</b>\n"
+            f"  {ist_now().strftime('%d.%m.%Y %H:%M')} Istanbul\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            "SISTEMLER:\n"
-            f"{'Aktif' if telethon_aktif else 'Pasif'} Telethon"
-            f"{' (' + str(len(TELEGRAM_KANALLARI)) + ' kanal)' if TELEGRAM_KANALLARI else ''}\n"
-            "Aktif: Kalici Dedup\n"
-            "Aktif: Source Tiering T1/T2/T3\n"
-            "Aktif: Event ID Dedup (20dk)\n"
-            "Aktif: Macro Engine (Finnhub + Hardcoded TR Takvim)\n"
-            "Aktif: Feedback Butonlari\n"
-            "Aktif: Brent Radar (%0.5 sari / %1.0 kirmizi)\n"
-            "Aktif: Brent Teknik (her 30dk)\n"
-            f"Aktif: ML {'(model yuklendi)' if ml.trained else '(birikim)'}\n"
-            "Aktif: Momentum Radar\n"
-            "Aktif: Sabah/Aksam Rapor\n"
-            "Aktif: Bare Ticker FA (TCELL yaz, analiz gelir)\n\n"
-            f"TZ: Europe/Istanbul | Model: {CLAUDE_MODEL}\n"
-            f"Global RSS: {len(RSS_GLOBAL)}  |  TR RSS: {len(RSS_TURKEY)}\n\n"
-            "ACIL[9-10]  ONEMLI[8]  TAKIP[7]\n"
+
+            "<b>📋 KOMUTLAR</b>\n"
+            "<code>TCELL</code>  — ticker yaz, temel analiz gelir\n"
+            "<code>/analiz THYAO</code>  — ayni sey\n"
+            "<code>/top10</code>  — BIST en iyi 10 hisse\n"
+            "<code>/radar</code>  — canli Brent + XU030 + USDTRY\n"
+            "<code>/durum</code>  — sistem durumu\n"
+            "<code>/heat THYAO</code>  — X (Twitter) heat skoru\n"
+            "<code>/watch THYAO GARAN</code>  — watchlist ekle\n"
+            "<code>/unwatch THYAO</code>  — cikar\n"
+            "<code>/watchlist</code>  — listeyi gor\n"
+            "<code>/help</code>  — bu menu\n\n"
+
+            "<b>🔔 OTOMATİK ALARMLAR</b>\n"
+            "Haber skoru 7+ → otomatik mesaj\n"
+            "Brent %0.5+ → sari, %1+ → kirmizi\n"
+            "DXY/VIX/XU030/USDTRY radar\n"
+            f"X Sentiment {'aktif' if TWSCRAPE_AVAILABLE else 'pasif (twscrape yukle)'}\n"
+            "Momentum (15dk 3+ haber → alarm)\n"
+            "Macro takvim (30dk once uyari)\n\n"
+
+            "<b>📊 ZAMANLI RAPORLAR</b>\n"
+            "09:45  Sabah brifing\n"
+            "13:00  Oglen rapor\n"
+            "17:45  Aksam ozet + yarin\n\n"
+
+            "<b>⚙️ MOTORLAR</b>\n"
+            f"RSS: GL{len(RSS_GLOBAL)} + TR{len(RSS_TURKEY)} kaynak\n"
+            f"ML: {'Model yuklendi' if ml.trained else 'Birikim'}\n"
+            f"FA: {len(FA_UNIVERSE)} hisse pre-cache\n"
+            "Dinamik esik (sessizse otomatik duser)\n"
+            f"TZ: Istanbul | AI: {CLAUDE_MODEL}\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n"
             "Izleme basladi..."
         ),
         parse_mode=ParseMode.HTML
     )
-    log.info("TERMINATOR v3.2 BASLADI!")
+    log.info("TERMINATOR v3.3 BASLADI!")
+
+    # Feedback long-poll — ayri task
+    asyncio.create_task(feedback_loop(bot))
+
+    # FA pre-cache — startup'ta arka planda
+    asyncio.get_running_loop().run_in_executor(None, fa_precache_all)
 
     while True:
         try:
             now   = time.time()
             simdi = ist_now()
-            dongu_sayac += 1
+            state.dongu_sayac += 1
 
             loop  = asyncio.get_running_loop()
-            g_raw = await loop.run_in_executor(None, rss_cek, RSS_GLOBAL)
+            g_raw = await loop.run_in_executor(None, lambda: rss_cek(RSS_GLOBAL, max_age_hours=4))
             g_raw += await loop.run_in_executor(None, finnhub_genel_cek)
-            t_raw = await loop.run_in_executor(None, rss_cek, RSS_TURKEY)
+            t_raw = await loop.run_in_executor(None, lambda: rss_cek(RSS_TURKEY, max_age_hours=12))
             t_raw += await loop.run_in_executor(None, marketaux_cek)
 
-            if dongu_sayac % 4 == 0:
+            if state.dongu_sayac % 4 == 0:
                 sirket  = await loop.run_in_executor(None, sirket_haberleri_cek)
                 sirket += await loop.run_in_executor(None, finnhub_bist_cek)
                 t_raw  += sirket
                 if sirket:
                     log.info(f"{len(sirket)} sirket haberi")
 
-            if telegram_kuyruk:
-                t_raw += telegram_kuyruk[:30]
-                telegram_kuyruk.clear()
+            if state.telegram_kuyruk:
+                t_raw += state.telegram_kuyruk[:30]
+                state.telegram_kuyruk.clear()
 
             acil_kuyruk = []
 
@@ -2673,7 +3237,6 @@ async def ana_dongu():
                         continue
                     gonderilen.add(hsh)
                     dedup_kaydet(hsh)
-                    # Sektor matrisi
                     sm_syms, sm_yon, sm_oz = sektor_analiz(h["baslik"])
                     if not h["semboller"]:
                         h["semboller"] = nov.entity_bul(h["baslik"])
@@ -2696,8 +3259,8 @@ async def ana_dongu():
                     else:
                         kuyruk.append(h)
 
-            isle(g_raw, bekl_global, "global")
-            isle(t_raw, bekl_turkey, "turkey")
+            isle(g_raw, state.bekl_global, "global")
+            isle(t_raw, state.bekl_turkey, "turkey")
 
             # ACİL — hemen gonder
             if acil_kuyruk:
@@ -2713,55 +3276,65 @@ async def ana_dongu():
                             reply_markup=feedback_keyboard(haber_id)
                         )
                         db_msg_id_guncelle(haber_id, sent.message_id)
-                        toplam_gonderilen += 1
+                        state.toplam_gonderilen += 1
                         await asyncio.sleep(1)
                     except Exception as ex:
                         log.error(f"Acil gonderme: {ex}")
 
-            toplam = len(bekl_global) + len(bekl_turkey)
+            toplam = len(state.bekl_global) + len(state.bekl_turkey)
             if toplam > 0:
-                log.info(f"Kuyruk: GL{len(bekl_global)} | TR{len(bekl_turkey)}")
+                log.info(f"Kuyruk: GL{len(state.bekl_global)} | TR{len(state.bekl_turkey)}")
 
-            # AI skorlama
-            yeterli = len(bekl_global) >= 5 or len(bekl_turkey) >= 5
-            if toplam > 0 and (yeterli or (now - son_ai) >= AI_INTERVAL):
-                son_ai       = now
+            # AI skorlama — dinamik esik
+            yeterli = len(state.bekl_global) >= 5 or len(state.bekl_turkey) >= 5
+            if toplam > 0 and (yeterli or (now - state.son_ai) >= AI_INTERVAL):
+                state.son_ai = now
                 gonderilenler = []
 
-                if bekl_global:
-                    sk = claude_skore_et(bekl_global[:20], "global")
+                if state.bekl_global:
+                    sk = claude_skore_et(state.bekl_global[:20], "global")
                     for h in sk:
                         h["fs"] = (h.get("skor",0) *
                                    h.get("novelty",1.0) *
                                    (1 + h.get("ml_skor",0.5)))
+                        # Watchlist bonus: esik -1
+                        if watchlist.haberde_var_mi(h.get("semboller",[])):
+                            h["fs"] *= 1.5
                     gonderilenler += [
                         (h, "global") for h in
                         sorted(
-                            [h for h in sk if h.get("skor",0) >= GLOBAL_THRESH],
+                            [h for h in sk if h.get("skor",0) >= state.global_thresh
+                             or (watchlist.haberde_var_mi(h.get("semboller",[])) and h.get("skor",0) >= max(5, state.global_thresh - 2))],
                             key=lambda x: x["fs"], reverse=True
                         )[:MAX_GLOBAL]
                     ]
-                    bekl_global = []
+                    state.bekl_global = []
 
-                if bekl_turkey:
-                    sk = claude_skore_et(bekl_turkey[:25], "turkey")
+                if state.bekl_turkey:
+                    sk = claude_skore_et(state.bekl_turkey[:25], "turkey")
                     for h in sk:
                         h["fs"] = (h.get("skor",0) *
                                    h.get("novelty",1.0) *
                                    (1 + h.get("ml_skor",0.5)))
+                        if watchlist.haberde_var_mi(h.get("semboller",[])):
+                            h["fs"] *= 1.5
                     gonderilenler += [
                         (h, "turkey") for h in
                         sorted(
-                            [h for h in sk if h.get("skor",0) >= TURKEY_THRESH],
+                            [h for h in sk if h.get("skor",0) >= state.turkey_thresh
+                             or (watchlist.haberde_var_mi(h.get("semboller",[])) and h.get("skor",0) >= max(5, state.turkey_thresh - 2))],
                             key=lambda x: x["fs"], reverse=True
                         )[:MAX_TURKEY]
                     ]
-                    bekl_turkey = []
+                    state.bekl_turkey = []
 
                 gonderilenler.sort(key=lambda x: x[0].get("fs",0), reverse=True)
 
+                # Dinamik esik guncelle
+                state.dinamik_esik_guncelle(gonderilenler)
+
                 if gonderilenler:
-                    log.info(f"Gonderiliyor: {len(gonderilenler)} haber")
+                    log.info(f"Gonderiliyor: {len(gonderilenler)} haber (TR_esik={state.turkey_thresh} GL_esik={state.global_thresh})")
                     for h, mod in gonderilenler:
                         try:
                             haber_id = db_kaydet(h, mod, gonderildi_flag=1)
@@ -2773,7 +3346,7 @@ async def ana_dongu():
                                 reply_markup=feedback_keyboard(haber_id)
                             )
                             db_msg_id_guncelle(haber_id, sent.message_id)
-                            toplam_gonderilen += 1
+                            state.toplam_gonderilen += 1
                             log.info(
                                 f"[{h['skor']}][{h.get('stream','?')}] "
                                 f"{h['baslik'][:65]}"
@@ -2782,21 +3355,42 @@ async def ana_dongu():
                         except Exception as ex:
                             log.error(f"Gonderme: {ex}")
                 else:
-                    log.info("Esik yok")
+                    log.info(f"Esik yok (TR={state.turkey_thresh} GL={state.global_thresh})")
 
             # Brent fiyat kontrolu (her 2 dk)
-            if (now - son_brent_fiyat) >= PRICE_INTERVAL:
-                son_brent_fiyat = now
+            if (now - state.son_brent_fiyat) >= PRICE_INTERVAL:
+                state.son_brent_fiyat = now
                 await brent_radar.fiyat_kontrol(bot)
 
             # Brent teknik (her 30 dk)
-            if (now - son_brent_teknik) >= BRENT_TEKNIK_INTERVAL:
-                son_brent_teknik = now
+            if (now - state.son_brent_teknik) >= BRENT_TEKNIK_INTERVAL:
+                state.son_brent_teknik = now
                 await brent_radar.teknik_gonder(bot)
 
+            # Market radar — DXY/VIX/XU030/USDTRY (her 3 dk)
+            if (now - state.son_radar) >= 180:
+                state.son_radar = now
+                try:
+                    alarms = await loop.run_in_executor(None, market_radar.kontrol)
+                    for inst, cfg, fiyat, baz, degisim, seviye, yon in alarms:
+                        await bot.send_message(
+                            chat_id=CHAT_ID,
+                            text=market_radar.alarm_mesaj(inst, cfg, fiyat, baz, degisim, seviye, yon),
+                            parse_mode=ParseMode.HTML
+                        )
+                except Exception as ex:
+                    log.debug(f"MarketRadar: {ex}")
+
+            # X Sentiment (her 3 dk)
+            if TWSCRAPE_AVAILABLE and (now - x_sentiment.last_scan) >= x_sentiment.SCAN_INTERVAL:
+                try:
+                    await x_sentiment.heat_kontrol(bot)
+                except Exception as ex:
+                    log.debug(f"XSentiment: {ex}")
+
             # Macro engine (her 60 sn)
-            if (now - son_macro) >= MACRO_INTERVAL:
-                son_macro = now
+            if (now - state.son_macro) >= MACRO_INTERVAL:
+                state.son_macro = now
                 await macro_engine.kontrol(bot)
 
             # Momentum alarmlar
@@ -2811,14 +3405,9 @@ async def ana_dongu():
                 except Exception as ex:
                     log.error(f"Momentum: {ex}")
 
-            # Feedback kontrolu (her 60 sn)
-            if (now - son_feedback) >= FEEDBACK_INTERVAL:
-                son_feedback = now
-                await feedback_kontrol(bot)
-
             # ML veri guncelle (her 20 dk)
-            if (now - son_ml_guncelle) >= 1200:
-                son_ml_guncelle = now
+            if (now - state.son_ml_guncelle) >= 1200:
+                state.son_ml_guncelle = now
                 await asyncio.get_running_loop().run_in_executor(
                     None, ml.fiyat_guncelle, [("move_5m",5), ("move_15m",15), ("move_60m",60)]
                 )
@@ -2826,61 +3415,65 @@ async def ana_dongu():
                         (simdi - ml.son_egitim).days >= 7):
                     await asyncio.get_running_loop().run_in_executor(None, ml.egit)
 
+            # FA pre-cache (her 4 saat)
+            if (now - state.son_fa_precache) >= 14400:
+                state.son_fa_precache = now
+                loop.run_in_executor(None, fa_precache_all)
+
             # Sabah brifing (09:45)
             if simdi.hour == 9 and simdi.minute == 45:
                 bugun_str = simdi.strftime("%Y%m%d")
-                if son_sabah_brifing != bugun_str:
-                    son_sabah_brifing = bugun_str
+                if state.son_sabah != bugun_str:
+                    state.son_sabah = bugun_str
                     await sabah_brifing(bot)
+
+            # Oglen brifing (13:00)
+            if simdi.hour == 13 and simdi.minute == 0:
+                bugun_str = simdi.strftime("%Y%m%d")
+                if state.son_oglen != bugun_str:
+                    state.son_oglen = bugun_str
+                    await oglen_brifing(bot)
 
             # Aksam ozeti (17:45)
             if simdi.hour == 17 and simdi.minute == 45:
                 bugun_str = simdi.strftime("%Y%m%d")
-                if son_aksam_ozeti != bugun_str:
-                    son_aksam_ozeti = bugun_str
+                if state.son_aksam != bugun_str:
+                    state.son_aksam = bugun_str
                     await aksam_ozeti(bot)
 
             # 6 saatlik sistem raporu
-            if (simdi - son_durum).total_seconds() > 21600:
-                son_durum = simdi
+            if (simdi - state.son_durum).total_seconds() > 21600:
+                state.son_durum = simdi
                 try:
                     with db_connect() as con:
-                        tk   = con.execute(
-                            "SELECT COUNT(*) FROM haberler"
-                        ).fetchone()[0]
-                        ml_v = con.execute(
-                            "SELECT COUNT(*) FROM haberler WHERE relative_move IS NOT NULL"
-                        ).fetchone()[0]
-                        fb_c = con.execute(
-                            "SELECT COUNT(*) FROM haberler WHERE feedback IS NOT NULL"
-                        ).fetchone()[0]
+                        tk   = con.execute("SELECT COUNT(*) FROM haberler").fetchone()[0]
+                        ml_v = con.execute("SELECT COUNT(*) FROM haberler WHERE relative_move IS NOT NULL").fetchone()[0]
+                        fb_c = con.execute("SELECT COUNT(*) FROM haberler WHERE feedback IS NOT NULL").fetchone()[0]
                 except Exception:
                     tk, ml_v, fb_c = 0, 0, 0
-
                 brent_su_an = brent_radar._brent_fiyat_cek()
                 brent_str   = f"Brent: {brent_su_an:.2f}" if brent_su_an else "Brent: —"
-
                 await bot.send_message(
                     chat_id=CHAT_ID,
                     text=(
                         f"━━━━━━━━━━━━━━━━━━━━━━\n"
                         f"📊 <b>SISTEM RAPORU</b>\n"
                         f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                        f"Calisma: {int((simdi-baslangic).total_seconds()//3600)} saat\n"
-                        f"Gonderilen: {toplam_gonderilen} haber\n"
+                        f"Calisma: {int((simdi-state.baslangic).total_seconds()//3600)} saat\n"
+                        f"Gonderilen: {state.toplam_gonderilen} haber\n"
                         f"DB kayit: {tk}\n"
-                        f"ML verisi: {ml_v}/{ml.MIN_VERI}\n"
-                        f"ML aktif: {'Evet' if ml.trained else 'Birikim devam'}\n"
-                        f"Feedback: {fb_c} etiket\n"
+                        f"ML verisi: {ml_v}/{ml.MIN_VERI} | {'Aktif' if ml.trained else 'Birikim'}\n"
+                        f"Feedback: {fb_c} | Esik: TR={state.turkey_thresh} GL={state.global_thresh}\n"
                         f"{brent_str}\n"
+                        f"Watchlist: {', '.join(watchlist.liste()[:5]) or '—'}\n"
                         f"{simdi.strftime('%d.%m.%Y %H:%M')}"
                     ),
                     parse_mode=ParseMode.HTML
                 )
 
-            # Hash temizle — DB'den taze yukle (komple silmek tehlikeli, tekrar gonderilebilir)
+            # Hash temizle
             if len(gonderilen) > 10000:
-                dedup_yukle()  # DB'den son 24 saati reload et
+                dedup_yukle()
                 log.info(f"Hash seti DB'den yenilendi: {len(gonderilen)}")
 
         except Exception as e:
