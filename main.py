@@ -3108,14 +3108,7 @@ def fa_precache_all():
 # ================================================================
 # FEEDBACK LONG-POLL TASK — ayri task, surekli dinle
 # ================================================================
-async def feedback_loop(bot):
-    """Ayri async task: telegram updates'i surekli dinle, butonlar aninda cevap versin"""
-    while True:
-        try:
-            await feedback_kontrol(bot)
-        except Exception as e:
-            log.debug(f"feedback_loop: {e}")
-        await asyncio.sleep(2)  # 2 saniyede bir kontrol (onceki 60sn idi!)
+# (feedback_kontrol artik ana dongude her iterasyonda cagrilir — ayri task 409 hatasi veriyordu)
 
 # ================================================================
 # ANA DONGU
@@ -3194,9 +3187,6 @@ async def ana_dongu():
         parse_mode=ParseMode.HTML
     )
     log.info("TERMINATOR v3.3 BASLADI!")
-
-    # Feedback long-poll — ayri task
-    asyncio.create_task(feedback_loop(bot))
 
     # FA pre-cache — startup'ta arka planda
     asyncio.get_running_loop().run_in_executor(None, fa_precache_all)
@@ -3475,6 +3465,9 @@ async def ana_dongu():
             if len(gonderilen) > 10000:
                 dedup_yukle()
                 log.info(f"Hash seti DB'den yenilendi: {len(gonderilen)}")
+
+            # Feedback + komut kontrol (her dongude — TCELL, /durum, /radar vs.)
+            await feedback_kontrol(bot)
 
         except Exception as e:
             log.error(f"Dongu hatasi: {e}")
