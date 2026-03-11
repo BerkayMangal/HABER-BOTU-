@@ -1,6 +1,7 @@
 #!/bin/bash
-# Her iki botu paralel calistir
+# Her botu paralel calistir
 python main.py &
 python fa_bot.py &
+python viop_server.py &
 wait -n
 exit $?
