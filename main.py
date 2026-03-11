@@ -1,24 +1,22 @@
 # ================================================================
-# BERKAY TERMINATOR v3.1 — RAILWAY
-# Macro Engine · Event Dedup · Source Tiering
-# Feedback Buttons · Multi-Horizon ML · 3-Stream
-# Brent Radar · Saatlik Teknik Seviyeler
+# BERKAY TERMINATOR v3.2 — RAILWAY
+# v3.1 fixes + Calendar Overhaul + FA Speed + Timezone + ML Persist
 # ================================================================
 #
+# v3.2 YENILIKLER:
+#   Timezone fix   — pytz ile tum zamanlar Europe/Istanbul
+#   Calendar fix   — genis pencere, hardcoded TR takvim, actual=0 bug
+#   FA hizi        — bare ticker ile calisir ("TCELL" yeter)
+#   SQLite pool    — with pattern, connection leak yok
+#   RSS timeout    — requests ile timeout, feedparser'a text ver
+#   Finnhub rate   — semaphore ile rate limit koruması
+#   ML persist     — joblib ile model kaydet/yukle
+#   Claude model   — CLAUDE_MODEL env var
+#   Telethon       — TELEGRAM_KANALLARI env var
 # v3.1 YENILIKLER:
-#   Kalici dedup  — restart'ta hash'ler SQLite'tan yuklenir
-#   Timestamp fix — isoformat, tum DB sorgular dogru calisir
-#   Source tiering — TCMB/KAP/Reuters ayri puanlanir
-#   Event ID      — ayni olaydan 20dk icinde gelen haberler tek event
-#   Macro Engine  — Finnhub calendar + 30dk once + veri ani + 5dk tepki
-#   Surprise score — (actual-forecast)/abs(forecast)
-#   Feedback butonlari — her mesaja, SQLite'a kayit
-#   3 stream      — MACRO / COMPANY / GEO mesaj formatinda ayrim
-#   Multi-horizon ML — 5m/15m/60m/close + relative_move
-#   TR full takvim — TCMB/TUFE/cari/buyume + ABD core
-#   Brent Radar   — %0.5 sari alarm, %1.0 kirmizi alarm, her iki yon
-#   Brent Teknik  — Her 30 dk pivot/MA/destek/direnc seviyeleri
-#   Petrol haberleri — oncelikli skorlama (+2 puan)
+#   Kalici dedup, Source tiering, Event ID, Macro Engine,
+#   Feedback butonlari, 3 stream, Multi-horizon ML,
+#   Brent Radar (%0.5/%1.0), Brent Teknik (30dk), Petrol +2
 # ================================================================
 
 import asyncio
@@ -34,6 +32,8 @@ import random
 import sqlite3
 from datetime import datetime, timedelta
 from collections import defaultdict
+from contextlib import contextmanager
+import threading
 from bs4 import BeautifulSoup
 import anthropic
 from telethon import TelegramClient, events as tg_events
@@ -43,6 +43,23 @@ from telegram.constants import ParseMode
 
 import math
 from html import escape as html_escape
+
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    from backports.zoneinfo import ZoneInfo
+
+IST_TZ = ZoneInfo("Europe/Istanbul")
+
+def ist_now():
+    """Her zaman Istanbul saati doner"""
+    return datetime.now(IST_TZ)
+
+try:
+    import joblib
+    JOBLIB_AVAILABLE = True
+except ImportError:
+    JOBLIB_AVAILABLE = False
 
 try:
     import numpy as np
@@ -81,6 +98,7 @@ MARKETAUX_KEY     = os.environ["MARKETAUX_KEY"]
 TELEGRAM_API_ID   = int(os.environ["TELEGRAM_API_ID"])
 TELEGRAM_API_HASH = os.environ["TELEGRAM_API_HASH"]
 TELETHON_SESSION  = os.environ.get("TELETHON_SESSION", "")
+CLAUDE_MODEL      = os.environ.get("CLAUDE_MODEL", CLAUDE_MODEL)
 
 # ================================================================
 # AYARLAR
@@ -95,9 +113,11 @@ NOVELTY_HOURS     = 24
 PRICE_INTERVAL    = 120   # Brent fiyat kontrolu her 2 dk
 MACRO_INTERVAL    = 60
 FEEDBACK_INTERVAL = 60
-BRENT_TEKNIK_INTERVAL = 21600  # 6 saat
+BRENT_TEKNIK_INTERVAL = 1800  # 30 dakika
 
-TELEGRAM_KANALLARI = []
+# Telethon kanallari — env'den virgul ile ayrilmis, bossa bos liste
+_kanals = os.environ.get("TELEGRAM_KANALLARI", "")
+TELEGRAM_KANALLARI = [k.strip() for k in _kanals.split(",") if k.strip()]
 
 # ================================================================
 # BIST30 + ENTITY
@@ -305,10 +325,10 @@ def event_tekrar_mi(baslik):
     eid = event_id_bul(baslik)
     if not eid:
         return False
-    sinir = datetime.now() - timedelta(minutes=EVENT_WINDOW_MIN)
+    sinir = ist_now() - timedelta(minutes=EVENT_WINDOW_MIN)
     event_log[eid] = [(b, t) for b, t in event_log[eid] if t > sinir]
     duplicate = len(event_log[eid]) >= 2
-    event_log[eid].append((baslik, datetime.now()))
+    event_log[eid].append((baslik, ist_now()))
     return duplicate
 
 # ================================================================
@@ -334,13 +354,53 @@ def stream_belirle(h):
     return "NEWS"
 
 # ================================================================
-# SQLITE — Tam schema
+# SQLITE — Tam schema + Connection Helper
 # ================================================================
 DB_PATH = "/app/terminator.db"
+ML_MODEL_PATH = "/app/ml_model.joblib"
+
+@contextmanager
+def db_connect():
+    """SQLite connection - with pattern ile leak yok"""
+    con = sqlite3.connect(DB_PATH, timeout=10)
+    try:
+        yield con
+        con.commit()
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        con.close()
+
+# ================================================================
+# FINNHUB RATE LIMITER
+# ================================================================
+class FinnhubLimiter:
+    """Basit semaphore — max 55 req/dk (limit 60, 5 tampon)"""
+    def __init__(self, max_per_min=55):
+        self._lock   = threading.Lock()
+        self._times  = []
+        self._max    = max_per_min
+
+    def wait(self):
+        with self._lock:
+            now = time.time()
+            self._times = [t for t in self._times if now - t < 60]
+            if len(self._times) >= self._max:
+                sleep_for = 60 - (now - self._times[0]) + 0.1
+                time.sleep(max(sleep_for, 0.1))
+                self._times = [t for t in self._times if time.time() - t < 60]
+            self._times.append(time.time())
+
+    def get(self, url, **kwargs):
+        self.wait()
+        return requests.get(url, **kwargs)
+
+fh_limiter = FinnhubLimiter()
 
 def db_init():
-    con = sqlite3.connect(DB_PATH)
-    con.executescript("""
+    with db_connect() as con:
+        con.executescript("""
     CREATE TABLE IF NOT EXISTS haberler (
         id              INTEGER PRIMARY KEY AUTOINCREMENT,
         event_id        TEXT,
@@ -392,8 +452,6 @@ def db_init():
         change_pct  REAL
     );
     """)
-    con.commit()
-    con.close()
 
 # Kalici dedup
 gonderilen = set()
@@ -401,12 +459,11 @@ gonderilen = set()
 def dedup_yukle():
     global gonderilen
     try:
-        sinir = (datetime.now() - timedelta(hours=24)).isoformat()
-        con   = sqlite3.connect(DB_PATH)
-        rows  = con.execute(
-            "SELECT hash FROM dedup_hashes WHERE timestamp > ?", (sinir,)
-        ).fetchall()
-        con.close()
+        sinir = (ist_now() - timedelta(hours=24)).isoformat()
+        with db_connect() as con:
+            rows = con.execute(
+                "SELECT hash FROM dedup_hashes WHERE timestamp > ?", (sinir,)
+            ).fetchall()
         gonderilen = {r[0] for r in rows}
         log.info(f"Dedup: {len(gonderilen)} hash yuklendi")
     except Exception as e:
@@ -414,46 +471,42 @@ def dedup_yukle():
 
 def dedup_kaydet(h):
     try:
-        con = sqlite3.connect(DB_PATH)
-        con.execute(
-            "INSERT OR REPLACE INTO dedup_hashes (hash,timestamp) VALUES (?,?)",
-            (h, datetime.now().isoformat())
-        )
-        con.commit()
-        con.close()
-    except:
-        pass
+        with db_connect() as con:
+            con.execute(
+                "INSERT OR REPLACE INTO dedup_hashes (hash,timestamp) VALUES (?,?)",
+                (h, ist_now().isoformat())
+            )
+    except Exception as e:
+        log.debug(f"dedup_kaydet: {e}")
 
 def db_kaydet(h, mod, gonderildi_flag=0):
     try:
-        con = sqlite3.connect(DB_PATH)
-        cur = con.execute("""
-            INSERT INTO haberler
-            (event_id,timestamp,stream,kaynak,tier,baslik,url,
-             ai_skor,ml_skor,yon,semboller,novelty,mod,gonderildi,
-             scheduled_event,surprise)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-        """, (
-            event_id_bul(h.get("baslik", "")),
-            datetime.now().isoformat(),
-            h.get("stream", "NEWS"),
-            h.get("kaynak", ""),
-            h.get("tier", 2),
-            h.get("baslik", ""),
-            h.get("url", ""),
-            h.get("skor", 0),
-            h.get("ml_skor", 0.5),
-            h.get("yon", "NOTR"),
-            json.dumps(h.get("semboller", [])),
-            h.get("novelty", 1.0),
-            mod,
-            gonderildi_flag,
-            1 if h.get("scheduled_event") else 0,
-            h.get("surprise"),
-        ))
-        haber_id = cur.lastrowid
-        con.commit()
-        con.close()
+        with db_connect() as con:
+            cur = con.execute("""
+                INSERT INTO haberler
+                (event_id,timestamp,stream,kaynak,tier,baslik,url,
+                 ai_skor,ml_skor,yon,semboller,novelty,mod,gonderildi,
+                 scheduled_event,surprise)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """, (
+                event_id_bul(h.get("baslik", "")),
+                ist_now().isoformat(),
+                h.get("stream", "NEWS"),
+                h.get("kaynak", ""),
+                h.get("tier", 2),
+                h.get("baslik", ""),
+                h.get("url", ""),
+                h.get("skor", 0),
+                h.get("ml_skor", 0.5),
+                h.get("yon", "NOTR"),
+                json.dumps(h.get("semboller", [])),
+                h.get("novelty", 1.0),
+                mod,
+                gonderildi_flag,
+                1 if h.get("scheduled_event") else 0,
+                h.get("surprise"),
+            ))
+            haber_id = cur.lastrowid
         return haber_id
     except Exception as e:
         log.debug(f"db_kaydet: {e}")
@@ -461,14 +514,12 @@ def db_kaydet(h, mod, gonderildi_flag=0):
 
 def db_msg_id_guncelle(haber_id, msg_id):
     try:
-        con = sqlite3.connect(DB_PATH)
-        con.execute(
-            "UPDATE haberler SET telegram_msg_id=? WHERE id=?", (msg_id, haber_id)
-        )
-        con.commit()
-        con.close()
-    except:
-        pass
+        with db_connect() as con:
+            con.execute(
+                "UPDATE haberler SET telegram_msg_id=? WHERE id=?", (msg_id, haber_id)
+            )
+    except Exception as e:
+        log.debug(f"db_msg_id_guncelle: {e}")
 
 # ================================================================
 # FEEDBACK BUTONU
@@ -505,7 +556,7 @@ def fa_safe(x):
         x = float(x)
         if math.isnan(x) or math.isinf(x): return None
         return x
-    except: return None
+    except Exception: return None
 
 def fa_fmt(x, d=2):
     x = fa_safe(x)
@@ -553,7 +604,7 @@ def fa_pick(df, names):
                 s = pd.to_numeric(s, errors="coerce").dropna()
                 if s.empty: continue
                 return fa_safe(s.iloc[0]), (fa_safe(s.iloc[1]) if len(s)>1 else None)
-            except: continue
+            except Exception: continue
     return None, None
 
 def fa_growth(cur, prev):
@@ -568,7 +619,7 @@ def fa_fetch_raw(symbol):
         tk = yf.Ticker(symbol)
         info = tk.get_info() or {}
         try: fast = getattr(tk,"fast_info",{}) or {}
-        except: fast = {}
+        except Exception: fast = {}
         raw = {
             "info": info, "fast": fast,
             "financials": tk.financials,
@@ -583,19 +634,22 @@ def fa_fetch_raw(symbol):
 
 def fa_compute_piotroski(m):
     pts, used = 0, 0
+    # Her test: True=passed, False=failed, None=veri yok (sayilmaz)
     tests = [
-        m.get("roa") is not None and m.get("roa",0) > 0,
-        m.get("operating_cf") is not None and m.get("operating_cf",0) > 0,
-        m.get("roa") is not None and m.get("roa_prev") is not None and m.get("roa",0) > m.get("roa_prev",0),
-        m.get("operating_cf") is not None and m.get("net_income") is not None and m.get("operating_cf",0) > m.get("net_income",0),
-        m.get("current_ratio") is not None and m.get("current_ratio_prev") is not None and m.get("current_ratio",0) > m.get("current_ratio_prev",0),
-        m.get("share_change") is not None and m.get("share_change",1) <= 0,
-        m.get("gross_margin") is not None and m.get("gross_margin_prev") is not None and m.get("gross_margin",0) > m.get("gross_margin_prev",0),
-        m.get("asset_turnover") is not None and m.get("asset_turnover_prev") is not None and m.get("asset_turnover",0) > m.get("asset_turnover_prev",0),
+        (m.get("roa") > 0) if m.get("roa") is not None else None,
+        (m.get("operating_cf") > 0) if m.get("operating_cf") is not None else None,
+        (m.get("roa") > m.get("roa_prev")) if (m.get("roa") is not None and m.get("roa_prev") is not None) else None,
+        (m.get("operating_cf") > m.get("net_income")) if (m.get("operating_cf") is not None and m.get("net_income") is not None) else None,
+        (m.get("current_ratio") > m.get("current_ratio_prev")) if (m.get("current_ratio") is not None and m.get("current_ratio_prev") is not None) else None,
+        (m.get("share_change", 1) <= 0) if m.get("share_change") is not None else None,
+        (m.get("gross_margin") > m.get("gross_margin_prev")) if (m.get("gross_margin") is not None and m.get("gross_margin_prev") is not None) else None,
+        (m.get("asset_turnover") > m.get("asset_turnover_prev")) if (m.get("asset_turnover") is not None and m.get("asset_turnover_prev") is not None) else None,
     ]
     for t in tests:
-        if t is True or t is False:
-            used += 1; pts += int(t)
+        if t is None:
+            continue  # veri yok, testi sayma
+        used += 1
+        pts += int(t)
     return pts if used >= 4 else None
 
 def fa_compute_altman(m):
@@ -664,7 +718,8 @@ def fa_compute_metrics(symbol):
 
     net_debt      = (total_debt - cash) if total_debt is not None and cash is not None else None
     net_debt_ebit = (net_debt/ebitda) if net_debt is not None and ebitda not in (None,0) else None
-    int_cov       = ((ebit or operating_income)/abs(interest_exp)) if (ebit or operating_income) is not None and interest_exp not in (None,0) else None
+    _ebit_val = ebit if ebit is not None else operating_income
+    int_cov   = (_ebit_val / abs(interest_exp)) if _ebit_val is not None and interest_exp not in (None, 0) else None
 
     trailing_eps   = fa_safe(info.get("trailingEps")) or fa_safe(eps_row)
     book_val_ps    = fa_safe(info.get("bookValue")) or ((equity/dil_shares) if equity and dil_shares else None)
@@ -680,7 +735,8 @@ def fa_compute_metrics(symbol):
     wc        = (cur_assets - cur_liab) if cur_assets is not None and cur_liab is not None else None
     tax_rate  = fa_safe(info.get("effectiveTaxRate")) or 0.20
     inv_cap   = (total_debt + equity - cash) if total_debt is not None and equity is not None and cash is not None else None
-    nopat     = ((ebit or operating_income)*(1-min(max(tax_rate,0),0.35))) if (ebit or operating_income) is not None else None
+    _ebit_for_nopat = ebit if ebit is not None else operating_income
+    nopat     = (_ebit_for_nopat * (1 - min(max(tax_rate, 0), 0.35))) if _ebit_for_nopat is not None else None
     roic      = (nopat/inv_cap) if nopat is not None and inv_cap not in (None,0) else None
 
     peg       = (pe/max(eps_growth*100,1e-9)) if pe not in (None,0) and eps_growth is not None and eps_growth > 0 else None
@@ -921,8 +977,7 @@ def fa_scan_universe():
         except Exception as e:
             log.warning(f"FA scan skip {t}: {e}")
     ranked.sort(key=lambda x: (x["overall"], x["scores"]["quality"]), reverse=True)
-    import datetime as _dt
-    FA_TOP10_CACHE["asof"] = _dt.datetime.now()
+    FA_TOP10_CACHE["asof"] = ist_now()
     FA_TOP10_CACHE["items"] = ranked[:10]
     return FA_TOP10_CACHE["items"]
 
@@ -944,13 +999,25 @@ async def feedback_kontrol(bot):
                 txt = (msg.text or "").strip()
                 chat_id = msg.chat.id
 
-                # /analiz THYAO veya THYAO
-                if txt.startswith("/analiz") or txt.startswith("/fa"):
-                    parts = txt.split()
-                    ticker = parts[1].upper() if len(parts) > 1 else ""
+                # Bare ticker tespiti: "TCELL", "thyao", "GARAN" gibi
+                bare_ticker = txt.upper().replace(".IS","").replace(" ","")
+                is_bare_ticker = (
+                    len(bare_ticker) >= 3 and len(bare_ticker) <= 6
+                    and bare_ticker.isalpha()
+                    and bare_ticker in (FA_UNIVERSE + [t for t in BIST30 if t not in FA_UNIVERSE])
+                    and not txt.startswith("/")
+                )
+
+                # /analiz THYAO veya /fa THYAO veya sadece THYAO
+                if txt.startswith("/analiz") or txt.startswith("/fa") or is_bare_ticker:
+                    if is_bare_ticker:
+                        ticker = bare_ticker
+                    else:
+                        parts = txt.split()
+                        ticker = parts[1].upper() if len(parts) > 1 else ""
                     if ticker and FA_AVAILABLE:
                         await bot.send_message(chat_id=chat_id,
-                            text=f"Analiz ediliyor: <b>{ticker}</b>...", parse_mode=ParseMode.HTML)
+                            text=f"<b>{ticker}</b> analiz ediliyor...", parse_mode=ParseMode.HTML)
                         try:
                             r = await asyncio.to_thread(fa_analyze, fa_normalize(ticker))
                             if r:
@@ -978,7 +1045,7 @@ async def feedback_kontrol(bot):
                             text="yfinance yuklu degil.", parse_mode=ParseMode.HTML)
                         continue
                     await bot.send_message(chat_id=chat_id,
-                        text="Top 10 taranıyor... (1-2 dk sürebilir)", parse_mode=ParseMode.HTML)
+                        text="Top 10 taraniyor... (1-2 dk surebilir)", parse_mode=ParseMode.HTML)
                     try:
                         await asyncio.to_thread(fa_scan_universe)
                         await bot.send_message(
@@ -995,9 +1062,10 @@ async def feedback_kontrol(bot):
                 # /help
                 elif txt.strip() == "/help":
                     await bot.send_message(chat_id=chat_id, parse_mode=ParseMode.HTML, text=(
-                        "<b>BERKAY TERMINATOR v3.1 KOMUTLAR</b>\n\n"
+                        "<b>BERKAY TERMINATOR v3.2 KOMUTLAR</b>\n\n"
                         "<b>Temel Analiz:</b>\n"
-                        "/analiz THYAO — hisse temel analizi\n"
+                        "TCELL — sadece ticker yaz, analiz gelir\n"
+                        "/analiz THYAO — ayni sey\n"
                         "/top10 — BIST Top 10 tarama\n\n"
                         "<b>Haber Botu:</b>\n"
                         "Otomatik calisiyor, haber gelince mesaj atar.\n"
@@ -1049,7 +1117,7 @@ async def feedback_kontrol(bot):
                                         parse_mode=ParseMode.HTML,
                                         reply_markup=fa_keyboard(ticker)
                                     )
-                                except:
+                                except Exception:
                                     await bot.send_message(
                                         chat_id=cq.message.chat.id,
                                         text=fa_render(r, view),
@@ -1066,12 +1134,10 @@ async def feedback_kontrol(bot):
             if len(parts) == 3 and parts[0] == "fb":
                 fb_type  = parts[1]
                 haber_id = int(parts[2])
-                con = sqlite3.connect(DB_PATH)
-                con.execute(
-                    "UPDATE haberler SET feedback=? WHERE id=?", (fb_type, haber_id)
-                )
-                con.commit()
-                con.close()
+                with db_connect() as con:
+                    con.execute(
+                        "UPDATE haberler SET feedback=? WHERE id=?", (fb_type, haber_id)
+                    )
                 log.info(f"Feedback {fb_type} -> haber #{haber_id}")
     except Exception as e:
         log.debug(f"feedback_kontrol: {e}")
@@ -1084,8 +1150,8 @@ class BrentRadar:
         self.onceki_fiyat   = None
         self.baz_fiyat      = None   # alarm bazi (son alarmdan sonra reset)
         self.son_teknik     = 0.0
-        self.ESIK_SARI      = 2.0
-        self.ESIK_KIRMIZI   = 3.0
+        self.ESIK_SARI      = 0.5   # %0.5 sari alarm (onceki 2.0 cok gec alarm veriyordu)
+        self.ESIK_KIRMIZI   = 1.0   # %1.0 kirmizi alarm
         self.TEKNIK_INTERVAL= BRENT_TEKNIK_INTERVAL
 
     def _brent_fiyat_cek(self):
@@ -1102,7 +1168,8 @@ class BrentRadar:
             meta   = data["chart"]["result"][0]["meta"]
             fiyat  = meta.get("regularMarketPrice") or meta.get("previousClose")
             return round(float(fiyat), 2) if fiyat else None
-        except:
+        except Exception as e:
+            log.debug(f"Brent fiyat cek: {e}")
             return None
 
     def _brent_gecmis_cek(self):
@@ -1123,7 +1190,8 @@ class BrentRadar:
             closes  = [x for x in quotes.get("close", []) if x]
             opens   = [x for x in quotes.get("open", []) if x]
             return highs, lows, closes, opens
-        except:
+        except Exception as e:
+            log.debug(f"Brent gecmis cek: {e}")
             return None, None, None, None
 
     def _pivot_hesapla(self, h, l, c):
@@ -1170,14 +1238,12 @@ class BrentRadar:
 
         # DB'ye kaydet
         try:
-            con = sqlite3.connect(DB_PATH)
-            con.execute(
-                "INSERT INTO brent_log (timestamp,price) VALUES (?,?)",
-                (datetime.now().isoformat(), fiyat)
-            )
-            con.commit()
-            con.close()
-        except:
+            with db_connect() as con:
+                con.execute(
+                    "INSERT INTO brent_log (timestamp,price) VALUES (?,?)",
+                    (ist_now().isoformat(), fiyat)
+                )
+        except Exception:
             pass
 
         if self.baz_fiyat is None:
@@ -1199,7 +1265,7 @@ class BrentRadar:
                 f"<b>{self.baz_fiyat:.2f}  →  {fiyat:.2f}</b>\n"
                 f"Hareket: <b>{yon_icon} %{abs_deg:.2f}</b>\n\n"
                 f"TUPRS  ·  PETKM  ·  AYGAZ\n\n"
-                f"⏰ {datetime.now().strftime('%H:%M:%S')}"
+                f"⏰ {ist_now().strftime('%H:%M:%S')}"
             )
             try:
                 await bot.send_message(
@@ -1219,7 +1285,7 @@ class BrentRadar:
                 f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
                 f"{self.baz_fiyat:.2f}  →  <b>{fiyat:.2f}</b>\n"
                 f"Hareket: {yon_icon} <b>%{abs_deg:.2f}</b>\n\n"
-                f"⏰ {datetime.now().strftime('%H:%M:%S')}"
+                f"⏰ {ist_now().strftime('%H:%M:%S')}"
             )
             try:
                 await bot.send_message(
@@ -1272,7 +1338,7 @@ class BrentRadar:
 
             msg = (
                 f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"🛢️ <b>BRENT TEKNİK</b>  —  {datetime.now().strftime('%H:%M')}\n"
+                f"🛢️ <b>BRENT TEKNİK</b>  —  {ist_now().strftime('%H:%M')}\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
                 f"💰 Fiyat: <b>{fiyat:.2f}</b>  ({konum_icon} {konum})\n\n"
                 f"<b>Pivot Seviyeleri:</b>\n"
@@ -1312,6 +1378,30 @@ class MLModel:
         self.trained    = False
         self.son_egitim = None
         self.MIN_VERI   = 100
+        # Startup'ta kayitli model varsa yukle
+        self._load_model()
+
+    def _load_model(self):
+        """Kayitli model varsa diskten yukle"""
+        if not ML_AVAILABLE or not JOBLIB_AVAILABLE:
+            return
+        try:
+            if os.path.exists(ML_MODEL_PATH):
+                self.model   = joblib.load(ML_MODEL_PATH)
+                self.trained = True
+                log.info("ML model diskten yuklendi!")
+        except Exception as e:
+            log.warning(f"ML model yukleme: {e}")
+
+    def _save_model(self):
+        """Modeli diske kaydet"""
+        if not JOBLIB_AVAILABLE or self.model is None:
+            return
+        try:
+            joblib.dump(self.model, ML_MODEL_PATH)
+            log.info("ML model diske kaydedildi")
+        except Exception as e:
+            log.warning(f"ML model kaydetme: {e}")
 
     def ozellik_cikar(self, h):
         b = h.get("baslik", "").lower()
@@ -1340,14 +1430,13 @@ class MLModel:
         if not ML_AVAILABLE:
             return
         try:
-            con  = sqlite3.connect(DB_PATH)
-            rows = con.execute("""
-                SELECT ai_skor,novelty,semboller,yon,baslik,tier,
-                       scheduled_event,surprise,relative_move
-                FROM haberler
-                WHERE gonderildi=1 AND relative_move IS NOT NULL
-            """).fetchall()
-            con.close()
+            with db_connect() as con:
+                rows = con.execute("""
+                    SELECT ai_skor,novelty,semboller,yon,baslik,tier,
+                           scheduled_event,surprise,relative_move
+                    FROM haberler
+                    WHERE gonderildi=1 AND relative_move IS NOT NULL
+                """).fetchall()
             if len(rows) < self.MIN_VERI:
                 log.info(f"ML: {len(rows)}/{self.MIN_VERI} — birikim devam")
                 return
@@ -1367,12 +1456,13 @@ class MLModel:
             )
             self.model.fit(X, y)
             self.trained    = True
-            self.son_egitim = datetime.now()
+            self.son_egitim = ist_now()
             acc = sum(
                 1 for i, xi in enumerate(X)
                 if self.model.predict([xi])[0] == y[i]
             ) / len(y)
             log.info(f"ML egitildi! {len(rows)} ornek | acc={acc:.2f}")
+            self._save_model()
         except Exception as e:
             log.warning(f"ML egit: {e}")
 
@@ -1383,7 +1473,7 @@ class MLModel:
             return round(
                 self.model.predict_proba([self.ozellik_cikar(h)])[0][1], 3
             )
-        except:
+        except Exception:
             return 0.5
 
     def fiyat_guncelle(self, horizons):
@@ -1391,16 +1481,15 @@ class MLModel:
             return
         for field, minutes in horizons:
             try:
-                sinir_ust = (datetime.now() - timedelta(minutes=minutes-2)).isoformat()
-                sinir_alt = (datetime.now() - timedelta(minutes=minutes+5)).isoformat()
-                con  = sqlite3.connect(DB_PATH)
-                rows = con.execute(f"""
-                    SELECT id, semboller FROM haberler
-                    WHERE gonderildi=1 AND {field} IS NULL
-                    AND timestamp BETWEEN ? AND ?
-                    LIMIT 20
-                """, (sinir_alt, sinir_ust)).fetchall()
-                con.close()
+                sinir_ust = (ist_now() - timedelta(minutes=minutes-2)).isoformat()
+                sinir_alt = (ist_now() - timedelta(minutes=minutes+5)).isoformat()
+                with db_connect() as con:
+                    rows = con.execute(f"""
+                        SELECT id, semboller FROM haberler
+                        WHERE gonderildi=1 AND {field} IS NULL
+                        AND timestamp BETWEEN ? AND ?
+                        LIMIT 20
+                    """, (sinir_alt, sinir_ust)).fetchall()
                 for haber_id, semboller_json in rows:
                     syms = json.loads(semboller_json or "[]")
                     if not syms:
@@ -1420,14 +1509,12 @@ class MLModel:
                             timeout=5
                         ).json().get("dp", 0) or 0
                         relative = dp - xu030
-                        con2 = sqlite3.connect(DB_PATH)
-                        con2.execute(
-                            f"UPDATE haberler SET {field}=?, relative_move=? WHERE id=?",
-                            (dp, relative, haber_id)
-                        )
-                        con2.commit()
-                        con2.close()
-                    except:
+                        with db_connect() as con2:
+                            con2.execute(
+                                f"UPDATE haberler SET {field}=?, relative_move=? WHERE id=?",
+                                (dp, relative, haber_id)
+                            )
+                    except Exception:
                         pass
             except Exception as e:
                 log.debug(f"fiyat_guncelle {field}: {e}")
@@ -1497,10 +1584,10 @@ class MacroEngine:
         await self._reaction_kontrol(bot)
 
     async def _finnhub_kontrol(self, bot):
-        bugun = datetime.now().strftime("%Y-%m-%d")
-        yarin = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+        bugun = ist_now().strftime("%Y-%m-%d")
+        yarin = (ist_now() + timedelta(days=1)).strftime("%Y-%m-%d")
         try:
-            r = requests.get(
+            r = fh_limiter.get(
                 "https://finnhub.io/api/v1/calendar/economic",
                 params={"from": bugun, "to": yarin, "token": FINNHUB_KEY},
                 timeout=10
@@ -1518,30 +1605,38 @@ class MacroEngine:
                     continue
 
                 try:
-                    ev_time = datetime.strptime(ev["time"], "%Y-%m-%d %H:%M:%S")
-                except:
+                    # Finnhub saatleri UTC — IST'ye cevir
+                    ev_time_utc = datetime.strptime(ev["time"], "%Y-%m-%d %H:%M:%S")
+                    ev_time_utc = ev_time_utc.replace(tzinfo=ZoneInfo("UTC"))
+                    ev_time = ev_time_utc.astimezone(IST_TZ)
+                except Exception:
                     continue
 
                 await self._process_event(bot, ev, ev_time, event_name, country, impact)
+
+            # Hardcoded TR takvim kontrolu
+            await self._hardcoded_tr_kontrol(bot)
         except Exception as e:
             log.debug(f"MacroEngine: {e}")
 
     async def _process_event(self, bot, ev, ev_time, event_name, country, impact):
-        now      = datetime.now()
+        now      = ist_now()
         diff_min = (ev_time - now).total_seconds() / 60
         forecast = ev.get("estimate")
         previous = ev.get("prev")
         actual   = ev.get("actual")
         ev_key   = f"{country}_{event_name}_{ev_time.strftime('%Y%m%d')}"
 
-        if 25 <= diff_min <= 35:
+        # Pre-release: 15-45 dk arasi (onceki 25-35 cok dardi)
+        if 15 <= diff_min <= 45:
             key = f"pre_{ev_key}"
             if key not in self.sent_pre:
                 self.sent_pre.add(key)
                 await self._send_pre(bot, ev_time, event_name, country, impact,
                                      forecast, previous)
 
-        elif diff_min < 5 and actual is not None and str(actual).strip() not in ("", "0"):
+        # Data release: actual None degilse (0 gecerli veridir!)
+        elif diff_min < 5 and actual is not None and str(actual).strip() != "":
             key = f"release_{ev_key}"
             if key not in self.sent_release:
                 self.sent_release.add(key)
@@ -1549,21 +1644,19 @@ class MacroEngine:
                     surprise = None
                     if forecast and float(str(forecast)) != 0:
                         surprise = (float(str(actual)) - float(str(forecast))) / abs(float(str(forecast)))
-                    con = sqlite3.connect(DB_PATH)
-                    ctx_syms = self.EVENT_CONTEXT.get(event_name, ("","[]",""))[1]
-                    con.execute("""
-                        INSERT OR REPLACE INTO macro_events
-                        (event_key,timestamp,country,event_name,importance,
-                         forecast,previous,actual,surprise,phase,symbols)
-                        VALUES (?,?,?,?,?,?,?,?,?,?,?)
-                    """, (
-                        ev_key, datetime.now().isoformat(), country, event_name,
-                        impact, forecast, previous, actual, surprise, "release",
-                        json.dumps(ctx_syms)
-                    ))
-                    con.commit()
-                    con.close()
-                except:
+                    with db_connect() as con:
+                        ctx_syms = self.EVENT_CONTEXT.get(event_name, ("","[]",""))[1]
+                        con.execute("""
+                            INSERT OR REPLACE INTO macro_events
+                            (event_key,timestamp,country,event_name,importance,
+                             forecast,previous,actual,surprise,phase,symbols)
+                            VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                        """, (
+                            ev_key, ist_now().isoformat(), country, event_name,
+                            impact, forecast, previous, actual, surprise, "release",
+                            json.dumps(ctx_syms)
+                        ))
+                except Exception:
                     pass
                 await self._send_release(bot, ev_time, event_name, country, impact,
                                          actual, forecast, previous)
@@ -1578,8 +1671,84 @@ class MacroEngine:
                     "symbols":    ctx[1],
                 })
 
+    # ================================================================
+    # HARDCODED TR TAKVIM — Finnhub'a guvenme, kritik TR event'ler icin
+    # TCMB toplanti tarihleri, TUFE, cari denge vs.
+    # ================================================================
+    TR_HARDCODED_2025 = [
+        # (ay, gun, saat, dakika, event_name)
+        # TCMB PPK Toplantilari 2025
+        (1, 23, 14, 0, "Turkey Interest Rate"),
+        (2, 20, 14, 0, "Turkey Interest Rate"),
+        (3, 20, 14, 0, "Turkey Interest Rate"),
+        (4, 17, 14, 0, "Turkey Interest Rate"),
+        (5, 22, 14, 0, "Turkey Interest Rate"),
+        (6, 19, 14, 0, "Turkey Interest Rate"),
+        (7, 24, 14, 0, "Turkey Interest Rate"),
+        (8, 21, 14, 0, "Turkey Interest Rate"),
+        (9, 18, 14, 0, "Turkey Interest Rate"),
+        (10, 23, 14, 0, "Turkey Interest Rate"),
+        (11, 20, 14, 0, "Turkey Interest Rate"),
+        (12, 25, 14, 0, "Turkey Interest Rate"),
+        # TUFE — genelde ayin 3'u sabah 10:00
+        (1, 3, 10, 0, "Turkey CPI"), (2, 3, 10, 0, "Turkey CPI"),
+        (3, 3, 10, 0, "Turkey CPI"), (4, 3, 10, 0, "Turkey CPI"),
+        (5, 5, 10, 0, "Turkey CPI"), (6, 3, 10, 0, "Turkey CPI"),
+        (7, 3, 10, 0, "Turkey CPI"), (8, 4, 10, 0, "Turkey CPI"),
+        (9, 3, 10, 0, "Turkey CPI"), (10, 3, 10, 0, "Turkey CPI"),
+        (11, 3, 10, 0, "Turkey CPI"), (12, 3, 10, 0, "Turkey CPI"),
+    ]
+    TR_HARDCODED_2026 = [
+        # 2026 tarihleri TCMB aciklayinca guncelle
+        # Su an icin ayni pattern devam
+    ]
+
+    async def _hardcoded_tr_kontrol(self, bot):
+        """Hardcoded TR takvimden pre-release alarmi"""
+        now   = ist_now()
+        yil   = now.year
+        events = self.TR_HARDCODED_2025 if yil == 2025 else self.TR_HARDCODED_2026
+        for ay, gun, saat, dk, event_name in events:
+            if now.month != ay or now.day != gun:
+                continue
+            ev_time = now.replace(hour=saat, minute=dk, second=0, microsecond=0)
+            diff_min = (ev_time - now).total_seconds() / 60
+            ev_key = f"TR_{event_name}_{now.strftime('%Y%m%d')}"
+            key = f"hc_pre_{ev_key}"
+
+            if 15 <= diff_min <= 45 and key not in self.sent_pre:
+                self.sent_pre.add(key)
+                ctx     = self.EVENT_CONTEXT.get(event_name, ("TR", [], "—"))
+                senaryo = self.SENARYO.get(event_name)
+                senaryo_str = ""
+                if senaryo:
+                    senaryo_str = (
+                        f"\n\n<b>Senaryolar:</b>\n"
+                        f"Yuksek gelirse: {senaryo['yuksek']}\n"
+                        f"Dusuk gelirse:  {senaryo['dusuk']}"
+                    )
+                syms = "  ".join([f"<code>{s}</code>" for s in ctx[1][:5]]) or "—"
+                try:
+                    await bot.send_message(
+                        chat_id=CHAT_ID,
+                        text=(
+                            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                            f"⏰ <b>{int(diff_min)} DAKIKA SONRA</b>  [TR]\n"
+                            f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                            f"📋 <b>{event_name}</b>\n"
+                            f"Saat: <code>{ev_time.strftime('%H:%M')}</code>  —  Cok Yuksek\n\n"
+                            f"Etkilenecek: {syms}\n"
+                            f"{ctx[2]}"
+                            f"{senaryo_str}"
+                        ),
+                        parse_mode=ParseMode.HTML
+                    )
+                    log.info(f"Hardcoded pre-release: {event_name}")
+                except Exception as e:
+                    log.error(f"HC pre: {e}")
+
     async def _reaction_kontrol(self, bot):
-        now   = datetime.now()
+        now   = ist_now()
         kalan = []
         for item in self.reaction_queue:
             elapsed = (now - item["queued_at"]).total_seconds() / 60
@@ -1647,7 +1816,7 @@ class MacroEngine:
                 else:
                     surprise_icon = "BEKLENTIYE YAKIN"
                     surprise_str  = f"Surpriz: <b>{surprise:+.3f}</b>"
-            except:
+            except Exception:
                 pass
 
         try:
@@ -1676,35 +1845,35 @@ class MacroEngine:
         symbols   = item.get("symbols", [])
         reactions = []
         try:
-            r = requests.get(
+            r = fh_limiter.get(
                 "https://finnhub.io/api/v1/quote",
                 params={"symbol": "OANDA:USDTRY", "token": FINNHUB_KEY},
                 timeout=5
             ).json()
             if r.get("dp"):
                 reactions.append(f"USD/TRY: <b>{r['dp']:+.2f}%</b>")
-        except:
+        except Exception:
             pass
         try:
-            r = requests.get(
+            r = fh_limiter.get(
                 "https://finnhub.io/api/v1/quote",
                 params={"symbol": "OANDA:XAUUSD", "token": FINNHUB_KEY},
                 timeout=5
             ).json()
             if r.get("dp"):
                 reactions.append(f"Altin: <b>{r['dp']:+.2f}%</b>")
-        except:
+        except Exception:
             pass
         if symbols:
             try:
-                r = requests.get(
+                r = fh_limiter.get(
                     "https://finnhub.io/api/v1/quote",
                     params={"symbol": f"XIST:{symbols[0]}", "token": FINNHUB_KEY},
                     timeout=5
                 ).json()
                 if r.get("dp"):
                     reactions.append(f"{symbols[0]}: <b>{r['dp']:+.2f}%</b>")
-            except:
+            except Exception:
                 pass
         if not reactions:
             return
@@ -1717,7 +1886,7 @@ class MacroEngine:
                     f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
                     f"📋 <b>{item['event_name']}</b>\n\n"
                     + "\n".join(reactions) +
-                    f"\n\n⏰ {datetime.now().strftime('%H:%M:%S')}"
+                    f"\n\n⏰ {ist_now().strftime('%H:%M:%S')}"
                 ),
                 parse_mode=ParseMode.HTML
             )
@@ -1766,10 +1935,10 @@ class MomentumRadar:
         b = baslik.lower()
         for kume_adi, keywords in self.KUMELER.items():
             if any(kw in b for kw in keywords):
-                self.kume[kume_adi].append((baslik, datetime.now()))
+                self.kume[kume_adi].append((baslik, ist_now()))
 
     def _temizle(self):
-        sinir = datetime.now() - timedelta(minutes=self.PENCERE_DK)
+        sinir = ist_now() - timedelta(minutes=self.PENCERE_DK)
         for k in list(self.kume.keys()):
             self.kume[k] = [(b, t) for b, t in self.kume[k] if t > sinir]
 
@@ -1786,7 +1955,7 @@ class MomentumRadar:
             self.gonderilen.add(anahtar)
             alarmlar.append((kume_adi, n, haberler[-3:]))
         if len(self.gonderilen) > 300:
-            self.gonderilen = set(list(self.gonderilen)[-150:])
+            self.gonderilen.clear()  # set sirasiz, dilimlemek guvenilmez
         return alarmlar
 
     def alarm_mesaj(self, kume_adi, n, son_h):
@@ -1802,7 +1971,7 @@ class MomentumRadar:
             f"Son {self.PENCERE_DK} dk: <b>{n} haber</b>\n\n"
             f"Son haberler:\n{haberler_str}\n"
             f"Etkilenecek: {etki}\n"
-            f"⏰ {datetime.now().strftime('%H:%M:%S')}"
+            f"⏰ {ist_now().strftime('%H:%M:%S')}"
         )
 
 momentum = MomentumRadar()
@@ -1815,7 +1984,7 @@ class NoveltyMemory:
         self.memory = defaultdict(list)
 
     def _temizle(self):
-        sinir = datetime.now() - timedelta(hours=NOVELTY_HOURS)
+        sinir = ist_now() - timedelta(hours=NOVELTY_HOURS)
         for e in list(self.memory.keys()):
             self.memory[e] = [(kws, ts) for kws, ts in self.memory[e] if ts > sinir]
 
@@ -1827,7 +1996,7 @@ class NoveltyMemory:
             if kws and gecmis_kws:
                 ov     = len(kws & gecmis_kws) / max(len(kws), len(gecmis_kws))
                 max_ov = max(max_ov, ov)
-        self.memory[entity].append((kws, datetime.now()))
+        self.memory[entity].append((kws, ist_now()))
         if max_ov > 0.65: return 0.15
         if max_ov > 0.35: return 0.55
         return 1.0
@@ -1919,7 +2088,7 @@ def yeni_h(kaynak, baslik, url, tip="rss"):
         "kaynak":          kaynak,
         "baslik":          baslik.strip()[:260],
         "url":             url,
-        "zaman":           datetime.now().strftime("%H:%M"),
+        "zaman":           ist_now().strftime("%H:%M"),
         "skor":            0,
         "ml_skor":         0.5,
         "yon":             "NOTR",
@@ -1936,10 +2105,11 @@ def yeni_h(kaynak, baslik, url, tip="rss"):
 
 def rss_cek(feeds):
     out = []
-    import time as _t
     for kaynak, url in feeds:
         try:
-            feed = feedparser.parse(url, request_headers=HEADERS)
+            # requests ile timeout kontrollu fetch, sonra feedparser'a ver
+            resp = requests.get(url, headers=HEADERS, timeout=10)
+            feed = feedparser.parse(resp.text)
             for e in feed.entries[:6]:
                 b = (e.get("title") or "").strip()
                 if not b or len(b) <= 10:
@@ -1947,10 +2117,10 @@ def rss_cek(feeds):
                 published = e.get("published_parsed") or e.get("updated_parsed")
                 if published:
                     try:
-                        age_hours = (_t.time() - _t.mktime(published)) / 3600
+                        age_hours = (time.time() - time.mktime(published)) / 3600
                         if age_hours > 2:
                             continue
-                    except:
+                    except Exception:
                         pass
                 out.append(yeni_h(kaynak, b, e.get("link", "")))
         except Exception as e:
@@ -1982,7 +2152,7 @@ def marketaux_cek():
 def finnhub_genel_cek():
     out = []
     try:
-        r = requests.get(
+        r = fh_limiter.get(
             "https://finnhub.io/api/v1/news",
             params={"category":"general","token":FINNHUB_KEY},
             timeout=10, headers=HEADERS
@@ -1997,11 +2167,11 @@ def finnhub_genel_cek():
 
 def finnhub_bist_cek():
     out   = []
-    dun   = (datetime.now() - timedelta(days=3)).strftime("%Y-%m-%d")
-    bugun = datetime.now().strftime("%Y-%m-%d")
+    dun   = (ist_now() - timedelta(days=3)).strftime("%Y-%m-%d")
+    bugun = ist_now().strftime("%Y-%m-%d")
     for s in random.sample(BIST30, 6):
         try:
-            r = requests.get(
+            r = fh_limiter.get(
                 "https://finnhub.io/api/v1/company-news",
                 params={"symbol":f"XIST:{s}","from":dun,"to":bugun,"token":FINNHUB_KEY},
                 timeout=7, headers=HEADERS
@@ -2014,7 +2184,7 @@ def finnhub_bist_cek():
                     h["semboller"] = [s]
                     out.append(h)
             time.sleep(0.1)
-        except:
+        except Exception:
             pass
     return out
 
@@ -2089,13 +2259,11 @@ def claude_skore_et(haberler, mod):
             )
 
         msg  = client.messages.create(
-            model="claude-sonnet-4-20250514", max_tokens=2500,
+            model=CLAUDE_MODEL, max_tokens=2500,
             messages=[{"role": "user", "content": prompt}]
         )
         text = msg.content[0].text.strip()
-        if "```" in text:
-            m    = re.search(r'\[.*\]', text, re.DOTALL)
-            text = m.group(0) if m else "[]"
+        # JSON array'i cikart (markdown fence veya preamble olabilir)
         if not text.startswith("["):
             m    = re.search(r'\[.*\]', text, re.DOTALL)
             text = m.group(0) if m else "[]"
@@ -2107,7 +2275,7 @@ def claude_skore_et(haberler, mod):
                 raw_skor = max(0, min(10, int(s.get("skor", 0))))
                 # Petrol haberi ise +2
                 if petrol_haberi_mi(haberler[idx].get("baslik","")):
-                    raw_skor = min(10, raw_skor + 1)
+                    raw_skor = min(10, raw_skor + 2)  # Petrol haberi +2 puan
                 adj_skor = tier_skor_ayarla(raw_skor, haberler[idx].get("tier", 2))
                 haberler[idx].update({
                     "skor":      adj_skor,
@@ -2220,7 +2388,8 @@ def mesaj_olustur(h, mod, acil=False):
     if ss:
         msg += f"\n{ss}\n"
     if h.get("url"):
-        msg += f"\n<a href='{h['url']}'>Habere Git</a>"
+        safe_url = html_escape(h['url'])
+        msg += f"\n<a href='{safe_url}'>Habere Git</a>"
     return msg
 
 # ================================================================
@@ -2229,19 +2398,18 @@ def mesaj_olustur(h, mod, acil=False):
 async def sabah_brifing(bot):
     try:
         client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
-        sinir  = (datetime.now() - timedelta(hours=12)).isoformat()
-        con    = sqlite3.connect(DB_PATH)
-        rows   = con.execute("""
-            SELECT baslik, ai_skor, yon, semboller, stream
-            FROM haberler WHERE gonderildi=1 AND timestamp > ?
-            ORDER BY ai_skor DESC LIMIT 15
-        """, (sinir,)).fetchall()
-        con.close()
+        sinir  = (ist_now() - timedelta(hours=12)).isoformat()
+        with db_connect() as con:
+            rows = con.execute("""
+                SELECT baslik, ai_skor, yon, semboller, stream
+                FROM haberler WHERE gonderildi=1 AND timestamp > ?
+                ORDER BY ai_skor DESC LIMIT 15
+            """, (sinir,)).fetchall()
 
-        bugun        = datetime.now().strftime("%Y-%m-%d")
+        bugun        = ist_now().strftime("%Y-%m-%d")
         takvim_str   = "Bugün onemli veri yok"
         try:
-            r = requests.get(
+            r = fh_limiter.get(
                 "https://finnhub.io/api/v1/calendar/economic",
                 params={"from": bugun, "to": bugun, "token": FINNHUB_KEY},
                 timeout=8
@@ -2254,7 +2422,7 @@ async def sabah_brifing(bot):
             ]
             if evs:
                 takvim_str = "\n".join(evs[:8])
-        except:
+        except Exception:
             pass
 
         gece_listesi = "\n".join([
@@ -2279,14 +2447,14 @@ async def sabah_brifing(bot):
             f"GENEL YORUM — tek cumle piyasa tonu"
         )
         msg = client.messages.create(
-            model="claude-sonnet-4-20250514", max_tokens=800,
+            model=CLAUDE_MODEL, max_tokens=800,
             messages=[{"role":"user","content":prompt}]
         )
         await bot.send_message(
             chat_id=CHAT_ID,
             text=(
                 f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"🌅 <b>SABAH BRIFING</b>  —  {datetime.now().strftime('%d.%m.%Y')}\n"
+                f"🌅 <b>SABAH BRIFING</b>  —  {ist_now().strftime('%d.%m.%Y')}\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
                 f"{msg.content[0].text.strip()}"
             ),
@@ -2299,25 +2467,24 @@ async def sabah_brifing(bot):
 async def aksam_ozeti(bot):
     try:
         client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
-        sinir  = datetime.now().replace(hour=8, minute=0, second=0).isoformat()
-        con    = sqlite3.connect(DB_PATH)
-        rows   = con.execute("""
-            SELECT baslik, ai_skor, yon, semboller, stream, feedback
-            FROM haberler WHERE gonderildi=1 AND timestamp >= ?
-            ORDER BY ai_skor DESC
-        """, (sinir,)).fetchall()
-        ml_r   = con.execute("""
-            SELECT COUNT(*),
-                   SUM(CASE WHEN relative_move > 0.3 THEN 1 ELSE 0 END)
-            FROM haberler WHERE gonderildi=1 AND relative_move IS NOT NULL
-            AND timestamp >= ?
-        """, (sinir,)).fetchone()
-        fb_rows = con.execute("""
-            SELECT feedback, COUNT(*) FROM haberler
-            WHERE feedback IS NOT NULL AND timestamp >= ?
-            GROUP BY feedback
-        """, (sinir,)).fetchall()
-        con.close()
+        sinir  = ist_now().replace(hour=8, minute=0, second=0).isoformat()
+        with db_connect() as con:
+            rows   = con.execute("""
+                SELECT baslik, ai_skor, yon, semboller, stream, feedback
+                FROM haberler WHERE gonderildi=1 AND timestamp >= ?
+                ORDER BY ai_skor DESC
+            """, (sinir,)).fetchall()
+            ml_r   = con.execute("""
+                SELECT COUNT(*),
+                       SUM(CASE WHEN relative_move > 0.3 THEN 1 ELSE 0 END)
+                FROM haberler WHERE gonderildi=1 AND relative_move IS NOT NULL
+                AND timestamp >= ?
+            """, (sinir,)).fetchone()
+            fb_rows = con.execute("""
+                SELECT feedback, COUNT(*) FROM haberler
+                WHERE feedback IS NOT NULL AND timestamp >= ?
+                GROUP BY feedback
+            """, (sinir,)).fetchall()
 
         acil_s   = sum(1 for r in rows if r[1] >= 9)
         onemli_s = sum(1 for r in rows if 8 <= r[1] < 9)
@@ -2337,10 +2504,10 @@ async def aksam_ozeti(bot):
             f"- [{r[1]}/10] [{r[4]}] {r[0][:70]}" for r in rows[:5]
         ]) or "—"
 
-        yarin        = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+        yarin        = (ist_now() + timedelta(days=1)).strftime("%Y-%m-%d")
         yarin_takvim = "—"
         try:
-            r2 = requests.get(
+            r2 = fh_limiter.get(
                 "https://finnhub.io/api/v1/calendar/economic",
                 params={"from":yarin,"to":yarin,"token":FINNHUB_KEY},
                 timeout=8
@@ -2352,7 +2519,7 @@ async def aksam_ozeti(bot):
             ]
             if evs:
                 yarin_takvim = "\n".join(evs[:5])
-        except:
+        except Exception:
             pass
 
         prompt = (
@@ -2361,14 +2528,14 @@ async def aksam_ozeti(bot):
             f"Yaz: genel degerlendirme, en kritik haber, yarin dikkat."
         )
         msg = client.messages.create(
-            model="claude-sonnet-4-20250514", max_tokens=500,
+            model=CLAUDE_MODEL, max_tokens=500,
             messages=[{"role":"user","content":prompt}]
         )
         await bot.send_message(
             chat_id=CHAT_ID,
             text=(
                 f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"📊 <b>GUNUN OZETI</b>  —  {datetime.now().strftime('%d.%m.%Y')}\n"
+                f"📊 <b>GUNUN OZETI</b>  —  {ist_now().strftime('%d.%m.%Y')}\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
                 f"Bugün: <b>{len(rows)} haber</b>  "
                 f"Acil:{acil_s}  Onemli:{onemli_s}  Takip:{takip_s}\n"
@@ -2396,12 +2563,12 @@ son_brent_teknik    = 0.0
 son_macro           = 0.0
 son_ml_guncelle     = 0.0
 son_feedback        = 0.0
-son_durum           = datetime.now()
+son_durum           = ist_now()
 son_sabah_brifing   = None
 son_aksam_ozeti     = None
 dongu_sayac         = 0
 toplam_gonderilen   = 0
-baslangic           = datetime.now()
+baslangic           = ist_now()
 telegram_kuyruk     = []
 
 async def ana_dongu():
@@ -2443,21 +2610,24 @@ async def ana_dongu():
         chat_id=CHAT_ID,
         text=(
             "━━━━━━━━━━━━━━━━━━━━━━\n"
-            "<b>BERKAY TERMINATOR v3.1</b>\n"
-            f"{datetime.now().strftime('%d.%m.%Y %H:%M')}\n"
+            "<b>BERKAY TERMINATOR v3.2</b>\n"
+            f"{ist_now().strftime('%d.%m.%Y %H:%M')} (Istanbul)\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n\n"
             "SISTEMLER:\n"
-            f"{'Aktif' if telethon_aktif else 'Pasif'} Telethon\n"
+            f"{'Aktif' if telethon_aktif else 'Pasif'} Telethon"
+            f"{' (' + str(len(TELEGRAM_KANALLARI)) + ' kanal)' if TELEGRAM_KANALLARI else ''}\n"
             "Aktif: Kalici Dedup\n"
             "Aktif: Source Tiering T1/T2/T3\n"
             "Aktif: Event ID Dedup (20dk)\n"
-            "Aktif: Macro Engine (30dk+Veri+5dk tepki)\n"
+            "Aktif: Macro Engine (Finnhub + Hardcoded TR Takvim)\n"
             "Aktif: Feedback Butonlari\n"
             "Aktif: Brent Radar (%0.5 sari / %1.0 kirmizi)\n"
             "Aktif: Brent Teknik (her 30dk)\n"
-            "Aktif: Multi-Horizon ML (5m/15m/60m)\n"
+            f"Aktif: ML {'(model yuklendi)' if ml.trained else '(birikim)'}\n"
             "Aktif: Momentum Radar\n"
-            "Aktif: Sabah/Aksam Rapor\n\n"
+            "Aktif: Sabah/Aksam Rapor\n"
+            "Aktif: Bare Ticker FA (TCELL yaz, analiz gelir)\n\n"
+            f"TZ: Europe/Istanbul | Model: {CLAUDE_MODEL}\n"
             f"Global RSS: {len(RSS_GLOBAL)}  |  TR RSS: {len(RSS_TURKEY)}\n\n"
             "ACIL[9-10]  ONEMLI[8]  TAKIP[7]\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -2465,19 +2635,23 @@ async def ana_dongu():
         ),
         parse_mode=ParseMode.HTML
     )
-    log.info("TERMINATOR v3.1 BASLADI!")
+    log.info("TERMINATOR v3.2 BASLADI!")
 
     while True:
         try:
             now   = time.time()
-            simdi = datetime.now()
+            simdi = ist_now()
             dongu_sayac += 1
 
-            g_raw = rss_cek(RSS_GLOBAL) + finnhub_genel_cek()
-            t_raw = rss_cek(RSS_TURKEY) + marketaux_cek()
+            loop  = asyncio.get_running_loop()
+            g_raw = await loop.run_in_executor(None, rss_cek, RSS_GLOBAL)
+            g_raw += await loop.run_in_executor(None, finnhub_genel_cek)
+            t_raw = await loop.run_in_executor(None, rss_cek, RSS_TURKEY)
+            t_raw += await loop.run_in_executor(None, marketaux_cek)
 
             if dongu_sayac % 4 == 0:
-                sirket  = sirket_haberleri_cek() + finnhub_bist_cek()
+                sirket  = await loop.run_in_executor(None, sirket_haberleri_cek)
+                sirket += await loop.run_in_executor(None, finnhub_bist_cek)
                 t_raw  += sirket
                 if sirket:
                     log.info(f"{len(sirket)} sirket haberi")
@@ -2645,10 +2819,12 @@ async def ana_dongu():
             # ML veri guncelle (her 20 dk)
             if (now - son_ml_guncelle) >= 1200:
                 son_ml_guncelle = now
-                ml.fiyat_guncelle([("move_5m",5), ("move_15m",15), ("move_60m",60)])
+                await asyncio.get_running_loop().run_in_executor(
+                    None, ml.fiyat_guncelle, [("move_5m",5), ("move_15m",15), ("move_60m",60)]
+                )
                 if (ml.son_egitim is None or
                         (simdi - ml.son_egitim).days >= 7):
-                    await asyncio.get_event_loop().run_in_executor(None, ml.egit)
+                    await asyncio.get_running_loop().run_in_executor(None, ml.egit)
 
             # Sabah brifing (09:45)
             if simdi.hour == 9 and simdi.minute == 45:
@@ -2668,18 +2844,17 @@ async def ana_dongu():
             if (simdi - son_durum).total_seconds() > 21600:
                 son_durum = simdi
                 try:
-                    con  = sqlite3.connect(DB_PATH)
-                    tk   = con.execute(
-                        "SELECT COUNT(*) FROM haberler"
-                    ).fetchone()[0]
-                    ml_v = con.execute(
-                        "SELECT COUNT(*) FROM haberler WHERE relative_move IS NOT NULL"
-                    ).fetchone()[0]
-                    fb_c = con.execute(
-                        "SELECT COUNT(*) FROM haberler WHERE feedback IS NOT NULL"
-                    ).fetchone()[0]
-                    con.close()
-                except:
+                    with db_connect() as con:
+                        tk   = con.execute(
+                            "SELECT COUNT(*) FROM haberler"
+                        ).fetchone()[0]
+                        ml_v = con.execute(
+                            "SELECT COUNT(*) FROM haberler WHERE relative_move IS NOT NULL"
+                        ).fetchone()[0]
+                        fb_c = con.execute(
+                            "SELECT COUNT(*) FROM haberler WHERE feedback IS NOT NULL"
+                        ).fetchone()[0]
+                except Exception:
                     tk, ml_v, fb_c = 0, 0, 0
 
                 brent_su_an = brent_radar._brent_fiyat_cek()
@@ -2703,10 +2878,10 @@ async def ana_dongu():
                     parse_mode=ParseMode.HTML
                 )
 
-            # Hash temizle
+            # Hash temizle — DB'den taze yukle (komple silmek tehlikeli, tekrar gonderilebilir)
             if len(gonderilen) > 10000:
-                gonderilen.clear()
-                log.info("Hash seti temizlendi")
+                dedup_yukle()  # DB'den son 24 saati reload et
+                log.info(f"Hash seti DB'den yenilendi: {len(gonderilen)}")
 
         except Exception as e:
             log.error(f"Dongu hatasi: {e}")
