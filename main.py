@@ -1488,52 +1488,115 @@ class MacroEngine:
         }
 
     async def kontrol(self, bot):
-        await self._finnhub_kontrol(bot)
+        await self._ff_kontrol(bot)
+        await self._hardcoded_tr_kontrol(bot)
         await self._reaction_kontrol(bot)
 
-    async def _finnhub_kontrol(self, bot):
-        bugun = ist_now().strftime("%Y-%m-%d")
-        yarin = (ist_now() + timedelta(days=1)).strftime("%Y-%m-%d")
+    def _parse_ff_xml(self):
+        """Forex Factory haftalik XML'i cek ve parse et"""
         try:
-            r = fh_limiter.get(
-                "https://finnhub.io/api/v1/calendar/economic",
-                params={"from": bugun, "to": yarin, "token": FINNHUB_KEY},
-                timeout=10
-            ).json()
-            events = r.get("economicCalendar", [])
-            tr_us_events = [e for e in events if e.get("country") in ("TR", "US")]
-            if tr_us_events and state.dongu_sayac % 30 == 1:
-                # Her 30 dongude (6dk) event listesini logla
-                log.info(f"MacroEngine: {len(tr_us_events)} TR/US event bulundu")
-                for ev in tr_us_events[:5]:
-                    log.info(f"  → {ev.get('country')} | {ev.get('event','?')[:40]} | {ev.get('time','?')} | impact={ev.get('impact','?')} | actual={ev.get('actual','')}")
+            import xml.etree.ElementTree as ET
+            resp = requests.get(
+                "https://nfs.faireconomy.media/ff_calendar_thisweek.xml",
+                timeout=15, headers={"User-Agent": "Mozilla/5.0"}
+            )
+            root = ET.fromstring(resp.content)
+            events = []
+            for ev in root.findall("event"):
+                title   = (ev.findtext("title") or "").strip()
+                country = (ev.findtext("country") or "").strip()  # USD, EUR, GBP vs.
+                date_s  = (ev.findtext("date") or "").strip()     # 03-12-2026
+                time_s  = (ev.findtext("time") or "").strip()     # 12:30pm
+                impact  = (ev.findtext("impact") or "").strip()   # High, Medium, Low
+                forecast= (ev.findtext("forecast") or "").strip()
+                previous= (ev.findtext("previous") or "").strip()
 
-            for ev in events:
-                country    = ev.get("country", "")
-                impact     = ev.get("impact", "")
-                event_name = ev.get("event", "")
-
-                if country == "TR":
-                    pass
-                elif country == "US" and impact in ["high", "medium"]:
-                    pass
-                else:
+                if not title or not date_s or not time_s:
+                    continue
+                if impact not in ("High", "Medium"):
+                    continue
+                # Sadece USD (ABD) event'leri — TR icin hardcoded takvim var
+                if country != "USD":
                     continue
 
+                # Tarih + saat parse (ET timezone)
                 try:
-                    # Finnhub saatleri UTC — IST'ye cevir
-                    ev_time_utc = datetime.strptime(ev["time"], "%Y-%m-%d %H:%M:%S")
-                    ev_time_utc = ev_time_utc.replace(tzinfo=ZoneInfo("UTC"))
-                    ev_time = ev_time_utc.astimezone(IST_TZ)
+                    # "03-12-2026" + "12:30pm" → datetime
+                    dt_str = f"{date_s} {time_s}"
+                    ev_dt = datetime.strptime(dt_str, "%m-%d-%Y %I:%M%p")
+                    # ET → Istanbul
+                    et_tz = ZoneInfo("America/New_York")
+                    ev_dt = ev_dt.replace(tzinfo=et_tz)
+                    ev_ist = ev_dt.astimezone(IST_TZ)
                 except Exception:
                     continue
 
-                await self._process_event(bot, ev, ev_time, event_name, country, impact)
+                # Finnhub event name'lere map et (mevcut EVENT_CONTEXT ile uyum)
+                ff_to_macro = {
+                    "Core CPI m/m": "United States CPI",
+                    "CPI m/m": "United States CPI",
+                    "CPI y/y": "United States CPI",
+                    "Core PCE Price Index m/m": "United States CPI",
+                    "Non-Farm Employment Change": "United States Non Farm Payrolls",
+                    "Unemployment Claims": "United States Initial Jobless Claims",
+                    "Unemployment Rate": "United States Unemployment Rate",
+                    "Prelim GDP q/q": "United States GDP",
+                    "Advance GDP q/q": "United States GDP",
+                    "Federal Funds Rate": "United States Interest Rate",
+                    "ISM Manufacturing PMI": "United States PMI",
+                    "ISM Services PMI": "United States PMI",
+                    "ADP Non-Farm Employment Change": "United States ADP Employment",
+                    "Retail Sales m/m": "United States Retail Sales",
+                    "PPI m/m": "United States PPI",
+                    "JOLTS Job Openings": "United States Unemployment Rate",
+                    "Prelim UoM Consumer Sentiment": "United States PMI",
+                    "Durable Goods Orders m/m": "United States GDP",
+                }
+                event_name = ff_to_macro.get(title, f"United States {title}")
 
-            # Hardcoded TR takvim kontrolu
-            await self._hardcoded_tr_kontrol(bot)
+                events.append({
+                    "event_name": event_name,
+                    "title_orig": title,
+                    "country": "US",
+                    "impact": impact,
+                    "ev_time": ev_ist,
+                    "forecast": forecast,
+                    "previous": previous,
+                })
+            return events
         except Exception as e:
-            log.warning(f"MacroEngine: {e}")
+            log.warning(f"FF XML parse: {e}")
+            return []
+
+    async def _ff_kontrol(self, bot):
+        """Forex Factory XML ile ekonomik takvim kontrolu"""
+        try:
+            events = await asyncio.get_running_loop().run_in_executor(None, self._parse_ff_xml)
+
+            if events and state.dongu_sayac % 30 == 1:
+                log.info(f"MacroEngine: {len(events)} USD High/Medium event (Forex Factory)")
+                for ev in events[:5]:
+                    log.info(f"  → {ev['title_orig'][:40]} | {ev['ev_time'].strftime('%H:%M')} IST | {ev['impact']} | F:{ev['forecast']}")
+
+            now = ist_now()
+            for ev in events:
+                ev_time    = ev["ev_time"]
+                diff_min   = (ev_time - now).total_seconds() / 60
+                event_name = ev["event_name"]
+                ev_key     = f"US_{event_name}_{ev_time.strftime('%Y%m%d')}"
+
+                # Pre-release: 15-45 dk arasi
+                if 15 <= diff_min <= 45:
+                    key = f"pre_{ev_key}"
+                    if key not in self.sent_pre:
+                        self.sent_pre.add(key)
+                        await self._send_pre(
+                            bot, ev_time, event_name, "US", ev["impact"],
+                            ev["forecast"] or None, ev["previous"] or None
+                        )
+
+        except Exception as e:
+            log.warning(f"MacroEngine FF: {e}")
 
     async def _process_event(self, bot, ev, ev_time, event_name, country, impact):
         now      = ist_now()
@@ -1829,6 +1892,35 @@ class MacroEngine:
             log.error(f"send_reaction: {e}")
 
 macro_engine = MacroEngine()
+
+def ff_takvim_str(target_date_str):
+    """Forex Factory XML'den belirli gun icin High/Medium USD event listesi dondur.
+       target_date_str: 'MM-DD-YYYY' formatinda (FF formatı)
+    """
+    try:
+        import xml.etree.ElementTree as ET
+        resp = requests.get(
+            "https://nfs.faireconomy.media/ff_calendar_thisweek.xml",
+            timeout=15, headers={"User-Agent": "Mozilla/5.0"}
+        )
+        root = ET.fromstring(resp.content)
+        evs = []
+        for ev in root.findall("event"):
+            date_s   = (ev.findtext("date") or "").strip()
+            if date_s != target_date_str:
+                continue
+            country  = (ev.findtext("country") or "").strip()
+            impact   = (ev.findtext("impact") or "").strip()
+            title    = (ev.findtext("title") or "").strip()
+            time_s   = (ev.findtext("time") or "").strip()
+            forecast = (ev.findtext("forecast") or "").strip()
+            if country != "USD" or impact not in ("High", "Medium"):
+                continue
+            fc = f" (F:{forecast})" if forecast else ""
+            evs.append(f"- {time_s} {title}{fc} [{impact}]")
+        return "\n".join(evs[:8]) if evs else None
+    except Exception:
+        return None
 
 # ================================================================
 # MOMENTUM RADAR
@@ -2350,22 +2442,12 @@ async def sabah_brifing(bot):
                 ORDER BY ai_skor DESC LIMIT 15
             """, (sinir,)).fetchall()
 
-        bugun        = ist_now().strftime("%Y-%m-%d")
+        bugun        = ist_now().strftime("%m-%d-%Y")  # FF format
         takvim_str   = "Bugün onemli veri yok"
         try:
-            r = fh_limiter.get(
-                "https://finnhub.io/api/v1/calendar/economic",
-                params={"from": bugun, "to": bugun, "token": FINNHUB_KEY},
-                timeout=8
-            ).json()
-            evs = [
-                f"- {ev['time'][11:16]} {ev['event']} [{ev.get('country','')}]"
-                for ev in r.get("economicCalendar", [])
-                if ev.get("impact") in ["high","medium"]
-                and ev.get("country") in ["TR","US"]
-            ]
-            if evs:
-                takvim_str = "\n".join(evs[:8])
+            ff = ff_takvim_str(bugun)
+            if ff:
+                takvim_str = ff
         except Exception:
             pass
 
@@ -2449,21 +2531,12 @@ async def aksam_ozeti(bot):
             f"- [{r[1]}/10] [{r[4]}] {r[0][:70]}" for r in rows[:5]
         ]) or "—"
 
-        yarin        = (ist_now() + timedelta(days=1)).strftime("%Y-%m-%d")
+        yarin        = (ist_now() + timedelta(days=1)).strftime("%m-%d-%Y")
         yarin_takvim = "—"
         try:
-            r2 = fh_limiter.get(
-                "https://finnhub.io/api/v1/calendar/economic",
-                params={"from":yarin,"to":yarin,"token":FINNHUB_KEY},
-                timeout=8
-            ).json()
-            evs = [
-                f"- {e['time'][11:16]} {e['event']}"
-                for e in r2.get("economicCalendar",[])
-                if e.get("impact") == "high" and e.get("country") in ["TR","US"]
-            ]
-            if evs:
-                yarin_takvim = "\n".join(evs[:5])
+            ff = ff_takvim_str(yarin)
+            if ff:
+                yarin_takvim = ff
         except Exception:
             pass
 
