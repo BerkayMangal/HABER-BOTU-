@@ -36,6 +36,7 @@ from contextlib import contextmanager
 import threading
 from bs4 import BeautifulSoup
 import anthropic
+from openai import OpenAI
 from telethon import TelegramClient, events as tg_events
 from telethon.sessions import StringSession
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
@@ -82,13 +83,15 @@ log = logging.getLogger(__name__)
 # ================================================================
 TELEGRAM_TOKEN    = os.environ["TELEGRAM_TOKEN"]
 CHAT_ID           = os.environ["CHAT_ID"]
-ANTHROPIC_KEY     = os.environ["ANTHROPIC_KEY"]
+ANTHROPIC_KEY     = os.environ.get("ANTHROPIC_KEY", "")  # brifing icin (opsiyonel)
+OPENAI_KEY        = os.environ["OPENAI_KEY"]             # skorlama icin (zorunlu)
 FINNHUB_KEY       = os.environ["FINNHUB_KEY"]
 MARKETAUX_KEY     = os.environ["MARKETAUX_KEY"]
 TELEGRAM_API_ID   = int(os.environ["TELEGRAM_API_ID"])
 TELEGRAM_API_HASH = os.environ["TELEGRAM_API_HASH"]
 TELETHON_SESSION  = os.environ.get("TELETHON_SESSION", "")
 CLAUDE_MODEL      = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-20250514")
+SCORING_MODEL     = os.environ.get("SCORING_MODEL", "gpt-4o-mini")  # ucuz + hizli
 
 # ================================================================
 # AYARLAR
@@ -684,7 +687,7 @@ class XSentimentEngine:
                 if len(tweet_texts) < 3:
                     continue
                 text_combined = "\n".join(tweet_texts[:20])
-                skor, yon, ozet = await self._claude_heat(ticker, text_combined, len(tweet_texts))
+                skor, yon, ozet = await self._ai_heat(ticker, text_combined, len(tweet_texts))
                 self.heat_cache[ticker] = (skor, yon, ozet, time.time())
                 if skor >= self.HEAT_THRESHOLD:
                     await self._alarm_gonder(bot, ticker, skor, yon, ozet, len(tweet_texts))
@@ -692,9 +695,9 @@ class XSentimentEngine:
             except Exception as e:
                 log.debug(f"X heat {ticker}: {e}")
 
-    async def _claude_heat(self, ticker, tweets_text, count):
+    async def _ai_heat(self, ticker, tweets_text, count):
         try:
-            client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+            client = OpenAI(api_key=OPENAI_KEY)
             prompt = (
                 f"Sen BIST traderisin. Son {count} tweet'i analiz et.\n"
                 f"Hisse: {ticker}\n\nTweetler:\n{tweets_text[:3000]}\n\n"
@@ -704,14 +707,16 @@ class XSentimentEngine:
                 f"60-74 = Normal konusuluyor\n"
                 f"40-59 = Soguk\n"
                 f"<40 = Negatif baski\n\n"
-                f"SADECE JSON:\n"
+                f"SADECE JSON, baska hicbir sey yazma:\n"
                 f'{{"skor":87,"yon":"BULLISH","ozet":"max 12 kelime Turkce"}}'
             )
-            msg = client.messages.create(
-                model=CLAUDE_MODEL, max_tokens=200,
-                messages=[{"role": "user", "content": prompt}]
+            resp = client.chat.completions.create(
+                model=SCORING_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=200,
+                temperature=0.3,
             )
-            text = msg.content[0].text.strip()
+            text = resp.choices[0].message.content.strip()
             if not text.startswith("{"):
                 m = re.search(r'\{.*\}', text, re.DOTALL)
                 text = m.group(0) if m else '{"skor":50,"yon":"NOTR","ozet":""}'
@@ -751,7 +756,7 @@ class XSentimentEngine:
             if len(tweet_texts) < 3:
                 return {"skor": 0, "yon": "NOTR", "ozet": "Yeterli tweet yok", "count": len(tweet_texts)}
             text_combined = "\n".join(tweet_texts[:20])
-            skor, yon, ozet = await self._claude_heat(ticker, text_combined, len(tweet_texts))
+            skor, yon, ozet = await self._ai_heat(ticker, text_combined, len(tweet_texts))
             return {"skor": skor, "yon": yon, "ozet": ozet, "count": len(tweet_texts)}
         except Exception as e:
             return {"skor": 0, "yon": "NOTR", "ozet": str(e), "count": 0}
@@ -2141,13 +2146,14 @@ def sirket_haberleri_cek():
     return out
 
 # ================================================================
-# CLAUDE ANALIZ
+# AI SKORLAMA — OpenAI GPT-4o-mini (ucuz + hizli)
+# Tum AI islemleri OpenAI uzerinden (~$15/ay)
 # ================================================================
-def claude_skore_et(haberler, mod):
+def ai_skore_et(haberler, mod):
     if not haberler:
         return []
     try:
-        client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+        client = OpenAI(api_key=OPENAI_KEY)
         liste  = "\n".join([
             f"{i+1}. [T{h['tier']}] {h['baslik']}"
             for i, h in enumerate(haberler)
@@ -2157,7 +2163,7 @@ def claude_skore_et(haberler, mod):
             prompt = (
                 f"Sen BIST/VIOP uzmani Turk trader. Global haberleri BIST etkisi ile skorla.\n"
                 f"Kaynak: T1=FED/ECB/Reuters/AP, T2=FT/WSJ/Axios/Politico/Bloomberg, T3=diger\n\n"
-                f"PUANLAMA — CÖMERT OL, bir trader bu haberi bilmeli mi?\n"
+                f"PUANLAMA — COMERT OL, bir trader bu haberi bilmeli mi?\n"
                 f"9-10 = Acil: Fed acil toplanti, savas, Hurmuz kapaniyor\n"
                 f"7-8  = Onemli: Merkez bankasi karari, petrol sert hareket, jeopolitik kriz, onemli veri\n"
                 f"6    = Takip: Veri aciklamasi, sektor haberi, EM geneli etkileyen gelisme\n"
@@ -2165,7 +2171,7 @@ def claude_skore_et(haberler, mod):
                 f"0-3  = Alakasiz: Magazin, spor, yerel politika\n\n"
                 f"ONEMLI: Petrol/enerji/Hurmuz/Iran haberleri minimum 7.\n"
                 f"Merkez bankasi haberleri minimum 7. EM/gelisen piyasa haberleri minimum 6.\n\n"
-                f"SADECE JSON:\n"
+                f"SADECE JSON array, baska hicbir sey yazma:\n"
                 f'[{{"id":1,"skor":8,"yon":"BEARISH","semboller":["TUPRS"],"ozet":"max 10 kelime Turkce"}}]\n\n'
                 f"Haberler:\n{liste}"
             )
@@ -2174,31 +2180,33 @@ def claude_skore_et(haberler, mod):
                 f"Sen BIST/VIOP uzmani Turk trader. Turkiye haberlerini skorla.\n"
                 f"BIST30: {', '.join(BIST30)}\n"
                 f"[SEMBOL] ile baslayanlar = sirket haberi — minimum 7 puan.\n\n"
-                f"PUANLAMA — CÖMERT OL, bir BIST traderi bu haberi bilmeli mi?\n"
+                f"PUANLAMA — COMERT OL, bir BIST traderi bu haberi bilmeli mi?\n"
                 f"9-10 = Acil: TCMB surpriz, TL krizi, buyuk deprem, KAP sermaye artirimi\n"
                 f"7-8  = Onemli: KAP karari, TUFE/buyume, BDDK, temettu, sektor gelismesi\n"
                 f"6    = Takip: Ekonomi yorumu, orta sirket haberi, sanayi verisi\n"
                 f"4-5  = Zayif: Kucuk sirket, rutin aciklama\n"
                 f"0-3  = Gurultu: Siyaset dedikodu, spor, magazin\n\n"
                 f"ONEMLI: Sirket haberleri ([SEMBOL]) minimum 7. Ekonomi verisi minimum 6.\n\n"
-                f"SADECE JSON:\n"
+                f"SADECE JSON array, baska hicbir sey yazma:\n"
                 f'[{{"id":1,"skor":8,"yon":"BULLISH","semboller":["THYAO"],"ozet":"max 10 kelime Turkce"}}]\n\n'
                 f"Haberler:\n{liste}"
             )
 
-        msg  = client.messages.create(
-            model=CLAUDE_MODEL, max_tokens=2500,
-            messages=[{"role": "user", "content": prompt}]
+        resp = client.chat.completions.create(
+            model=SCORING_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=2500,
+            temperature=0.3,
         )
-        text = msg.content[0].text.strip()
-        # JSON array'i cikart — daha robust parsing
+        text = resp.choices[0].message.content.strip()
+        # JSON parse
         try:
             if not text.startswith("["):
                 m = re.search(r'\[\s*\{.*?\}\s*\]', text, re.DOTALL)
                 text = m.group(0) if m else "[]"
-            json.loads(text)  # validate
+            json.loads(text)
         except (json.JSONDecodeError, AttributeError):
-            log.warning(f"Claude JSON parse hatasi, fallback 0 skor")
+            log.warning(f"AI JSON parse hatasi, fallback 0 skor")
             text = "[]"
 
         for s in json.loads(text):
@@ -2206,9 +2214,8 @@ def claude_skore_et(haberler, mod):
             if 0 <= idx < len(haberler):
                 mevcut   = haberler[idx].get("semboller", [])
                 raw_skor = max(0, min(10, int(s.get("skor", 0))))
-                # Petrol haberi ise +2
                 if petrol_haberi_mi(haberler[idx].get("baslik","")):
-                    raw_skor = min(10, raw_skor + 2)  # Petrol haberi +2 puan
+                    raw_skor = min(10, raw_skor + 2)
                 adj_skor = tier_skor_ayarla(raw_skor, haberler[idx].get("tier", 2))
                 haberler[idx].update({
                     "skor":      adj_skor,
@@ -2217,7 +2224,7 @@ def claude_skore_et(haberler, mod):
                     "ozet":      s.get("ozet", "")
                 })
     except Exception as e:
-        log.warning(f"Claude ({mod}): {e}")
+        log.warning(f"AI skor ({mod}): {e}")
     return haberler
 
 # ================================================================
@@ -2335,7 +2342,6 @@ def mesaj_olustur(h, mod, acil=False):
 # ================================================================
 async def sabah_brifing(bot):
     try:
-        client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
         sinir  = (ist_now() - timedelta(hours=12)).isoformat()
         with db_connect() as con:
             rows = con.execute("""
@@ -2384,17 +2390,19 @@ async def sabah_brifing(bot):
             f"GOZETLEME — bugun dikkat edilecek 3 hisse + neden\n"
             f"GENEL YORUM — tek cumle piyasa tonu"
         )
-        msg = client.messages.create(
-            model=CLAUDE_MODEL, max_tokens=800,
+        oai = OpenAI(api_key=OPENAI_KEY)
+        resp = oai.chat.completions.create(
+            model=SCORING_MODEL, max_tokens=800,
             messages=[{"role":"user","content":prompt}]
         )
+        ai_text = resp.choices[0].message.content.strip()
         await bot.send_message(
             chat_id=CHAT_ID,
             text=(
                 f"━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"🌅 <b>SABAH BRIFING</b>  —  {ist_now().strftime('%d.%m.%Y')}\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"{msg.content[0].text.strip()}"
+                f"{ai_text}"
             ),
             parse_mode=ParseMode.HTML
         )
@@ -2404,7 +2412,6 @@ async def sabah_brifing(bot):
 
 async def aksam_ozeti(bot):
     try:
-        client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
         sinir  = ist_now().replace(hour=8, minute=0, second=0).isoformat()
         with db_connect() as con:
             rows   = con.execute("""
@@ -2465,10 +2472,12 @@ async def aksam_ozeti(bot):
             f"EN ONEMLI HABERLER:\n{top5}\n"
             f"Yaz: genel degerlendirme, en kritik haber, yarin dikkat."
         )
-        msg = client.messages.create(
-            model=CLAUDE_MODEL, max_tokens=500,
+        oai = OpenAI(api_key=OPENAI_KEY)
+        resp = oai.chat.completions.create(
+            model=SCORING_MODEL, max_tokens=500,
             messages=[{"role":"user","content":prompt}]
         )
+        ai_text = resp.choices[0].message.content.strip()
         await bot.send_message(
             chat_id=CHAT_ID,
             text=(
@@ -2481,7 +2490,7 @@ async def aksam_ozeti(bot):
                 f"ML dogruluk: {ml_oran} ({ml_t} olcum)\n"
                 f"Feedback: {fb_str}\n\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"{msg.content[0].text.strip()}\n\n"
+                f"{ai_text}\n\n"
                 f"<b>Yarin:</b>\n{yarin_takvim}"
             ),
             parse_mode=ParseMode.HTML
@@ -2495,7 +2504,6 @@ async def aksam_ozeti(bot):
 # ================================================================
 async def oglen_brifing(bot):
     try:
-        client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
         sinir  = ist_now().replace(hour=9, minute=0, second=0).isoformat()
         with db_connect() as con:
             rows = con.execute("""
@@ -2512,17 +2520,19 @@ async def oglen_brifing(bot):
             f"SABAHTAN BU YANA:\n{liste}\n\nPIYASA: {ctx}\n\n"
             f"Yaz: En sicak 5 hisse + neden. Ogleden sonra dikkat edilecekler."
         )
-        msg = client.messages.create(
-            model=CLAUDE_MODEL, max_tokens=500,
+        oai = OpenAI(api_key=OPENAI_KEY)
+        resp = oai.chat.completions.create(
+            model=SCORING_MODEL, max_tokens=500,
             messages=[{"role":"user","content":prompt}]
         )
+        ai_text = resp.choices[0].message.content.strip()
         await bot.send_message(
             chat_id=CHAT_ID,
             text=(
                 f"━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"☀️ <b>OGLEN RAPORU</b>  —  {ist_now().strftime('%d.%m.%Y %H:%M')}\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"{msg.content[0].text.strip()}"
+                f"{ai_text}"
             ),
             parse_mode=ParseMode.HTML
         )
@@ -2610,7 +2620,7 @@ async def ana_dongu():
             f"ML: {'Model yuklendi' if ml.trained else 'Birikim'}\n"
             "FA botu ayri calisiyor\n"
             "Dinamik esik (sessizse otomatik duser)\n"
-            f"TZ: Istanbul | AI: {CLAUDE_MODEL}\n"
+            f"TZ: Istanbul | AI: {SCORING_MODEL}\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n"
             "Izleme basladi..."
         ),
@@ -2711,7 +2721,7 @@ async def ana_dongu():
                 gonderilenler = []
 
                 if state.bekl_global:
-                    sk = claude_skore_et(state.bekl_global[:20], "global")
+                    sk = ai_skore_et(state.bekl_global[:20], "global")
                     for h in sk:
                         h["fs"] = (h.get("skor",0) *
                                    h.get("novelty",1.0) *
@@ -2730,7 +2740,7 @@ async def ana_dongu():
                     state.bekl_global = []
 
                 if state.bekl_turkey:
-                    sk = claude_skore_et(state.bekl_turkey[:25], "turkey")
+                    sk = ai_skore_et(state.bekl_turkey[:25], "turkey")
                     for h in sk:
                         h["fs"] = (h.get("skor",0) *
                                    h.get("novelty",1.0) *
