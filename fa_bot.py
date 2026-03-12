@@ -1,10 +1,12 @@
 # ================================================================
-# BERKAY FUNDAMENTALS V4 — Railway Edition
+# BERKAY FUNDAMENTALS V5 — Railway Edition
 # Ayri bot token ile calisir, main.py'den bagimsiz
+# V5: Teknik analiz, chart, AI ozet, Cross Hunter, emoji skorlar
 # ================================================================
 
-import sys, importlib.util, os, re, math, asyncio, logging, datetime as dt
+import sys, importlib.util, os, re, math, asyncio, logging, datetime as dt, io, time
 from html import escape as html_escape
+from collections import defaultdict
 
 import numpy as np
 import pandas as pd
@@ -21,7 +23,22 @@ from telegram.ext import (
     filters,
 )
 
-BOT_VERSION = "V4"
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import matplotlib.dates as mdates
+    CHART_AVAILABLE = True
+except ImportError:
+    CHART_AVAILABLE = False
+
+try:
+    from openai import OpenAI
+    AI_AVAILABLE = True
+except ImportError:
+    AI_AVAILABLE = False
+
+BOT_VERSION = "V5"
 APP_NAME = "BERKAY FUNDAMENTALS"
 CONFIDENCE_MIN = 55
 
@@ -31,6 +48,8 @@ CONFIDENCE_MIN = 55
 TOKEN = os.environ["FA_BOT_TOKEN"]
 CHAT_ID = os.environ.get("CHAT_ID", "")
 ALLOWED_CHAT_ID = int(CHAT_ID) if CHAT_ID else None
+OPENAI_KEY = os.environ.get("OPENAI_KEY", "")
+SCORING_MODEL = os.environ.get("SCORING_MODEL", "gpt-4o-mini")
 
 # ================================================================
 # UNIVERSE
@@ -301,6 +320,8 @@ def compute_metrics(symbol):
         "symbol": symbol, "ticker": base_ticker(symbol),
         "name": str(info.get("shortName") or info.get("longName") or symbol),
         "currency": str(info.get("currency") or ""),
+        "sector": str(info.get("sector") or ""),
+        "industry": str(info.get("industry") or ""),
         "price": price, "market_cap": market_cap,
         "pe": pe, "pb": pb, "ev_ebitda": ev_ebitda, "dividend_yield": div_yield, "beta": beta,
         "revenue": revenue, "revenue_prev": revenue_prev,
@@ -478,27 +499,440 @@ def analyze_symbol(symbol):
     return r
 
 # ================================================================
-# RENDERERS
+# TECHNICAL ANALYSIS MODULE (V5)
+# ================================================================
+TECH_CACHE = TTLCache(maxsize=500, ttl=3600)  # 1 saat cache
+
+def compute_technical(symbol):
+    """yfinance'ten 1 yillik veri cek, teknik sinyalleri hesapla"""
+    if symbol in TECH_CACHE:
+        return TECH_CACHE[symbol]
+    try:
+        tk = yf.Ticker(symbol)
+        df = tk.history(period="1y", interval="1d")
+        if df is None or len(df) < 50:
+            return None
+        c = df["Close"]
+        v = df["Volume"]
+
+        # MA50 / MA200
+        ma50 = c.rolling(50).mean()
+        ma200 = c.rolling(200).mean() if len(c) >= 200 else pd.Series([np.nan]*len(c))
+        price = float(c.iloc[-1])
+        ma50_val = float(ma50.iloc[-1]) if not np.isnan(ma50.iloc[-1]) else None
+        ma200_val = float(ma200.iloc[-1]) if len(c) >= 200 and not np.isnan(ma200.iloc[-1]) else None
+
+        # Golden/Death Cross detection
+        cross_signal = None
+        if ma50_val and ma200_val and len(ma50) >= 2 and len(ma200) >= 2:
+            prev_50 = float(ma50.iloc[-2]) if not np.isnan(ma50.iloc[-2]) else None
+            prev_200 = float(ma200.iloc[-2]) if not np.isnan(ma200.iloc[-2]) else None
+            if prev_50 and prev_200:
+                if prev_50 <= prev_200 and ma50_val > ma200_val:
+                    cross_signal = "GOLDEN_CROSS"
+                elif prev_50 >= prev_200 and ma50_val < ma200_val:
+                    cross_signal = "DEATH_CROSS"
+
+        # RSI (14)
+        delta = c.diff()
+        gain = delta.clip(lower=0).rolling(14).mean()
+        loss = (-delta.clip(upper=0)).rolling(14).mean()
+        rs = gain / loss.replace(0, np.nan)
+        rsi = 100 - (100 / (1 + rs))
+        rsi_val = float(rsi.iloc[-1]) if not np.isnan(rsi.iloc[-1]) else None
+
+        # MACD
+        ema12 = c.ewm(span=12).mean()
+        ema26 = c.ewm(span=26).mean()
+        macd_line = ema12 - ema26
+        signal_line = macd_line.ewm(span=9).mean()
+        macd_val = float(macd_line.iloc[-1])
+        signal_val = float(signal_line.iloc[-1])
+        macd_hist = macd_val - signal_val
+        macd_bullish = macd_val > signal_val
+        # MACD crossover (yeni mi?)
+        macd_cross = None
+        if len(macd_line) >= 2:
+            prev_macd = float(macd_line.iloc[-2])
+            prev_sig = float(signal_line.iloc[-2])
+            if prev_macd <= prev_sig and macd_val > signal_val:
+                macd_cross = "BULLISH"
+            elif prev_macd >= prev_sig and macd_val < signal_val:
+                macd_cross = "BEARISH"
+
+        # Bollinger Bands
+        bb_mid = c.rolling(20).mean()
+        bb_std = c.rolling(20).std()
+        bb_upper = bb_mid + 2 * bb_std
+        bb_lower = bb_mid - 2 * bb_std
+        bb_pos = None
+        if not np.isnan(bb_upper.iloc[-1]) and not np.isnan(bb_lower.iloc[-1]):
+            if price > float(bb_upper.iloc[-1]):
+                bb_pos = "ABOVE"
+            elif price < float(bb_lower.iloc[-1]):
+                bb_pos = "BELOW"
+            else:
+                bb_pos = "INSIDE"
+
+        # 52W High/Low
+        high_52w = float(df["High"].tail(252).max()) if len(df) >= 50 else None
+        low_52w = float(df["Low"].tail(252).min()) if len(df) >= 50 else None
+        pct_from_high = ((price - high_52w) / high_52w * 100) if high_52w else None
+        pct_from_low = ((price - low_52w) / low_52w * 100) if low_52w else None
+
+        # Volume trend
+        vol_avg = float(v.tail(20).mean()) if len(v) >= 20 else None
+        vol_today = float(v.iloc[-1]) if len(v) > 0 else None
+        vol_ratio = (vol_today / vol_avg) if vol_avg and vol_avg > 0 else None
+
+        # Teknik skor hesapla (0-100)
+        tech_score = 50.0
+        components = []
+        if rsi_val is not None:
+            if 40 <= rsi_val <= 60: components.append(("RSI", 50, "Notr"))
+            elif 30 <= rsi_val < 40: components.append(("RSI", 65, "Oversold yakinlasma"))
+            elif rsi_val < 30: components.append(("RSI", 85, "Asiri satim"))
+            elif 60 < rsi_val <= 70: components.append(("RSI", 40, "Overbought yakinlasma"))
+            else: components.append(("RSI", 20, "Asiri alim"))
+        if ma50_val:
+            if price > ma50_val:
+                components.append(("MA50", 70, "Fiyat MA50 uzerinde"))
+            else:
+                components.append(("MA50", 30, "Fiyat MA50 altinda"))
+        if ma200_val:
+            if price > ma200_val:
+                components.append(("MA200", 75, "Fiyat MA200 uzerinde"))
+            else:
+                components.append(("MA200", 25, "Fiyat MA200 altinda"))
+        if ma50_val and ma200_val:
+            if ma50_val > ma200_val:
+                components.append(("Trend", 80, "MA50 > MA200 (Yukari)"))
+            else:
+                components.append(("Trend", 20, "MA50 < MA200 (Asagi)"))
+        if macd_bullish:
+            components.append(("MACD", 70, "Bullish"))
+        else:
+            components.append(("MACD", 30, "Bearish"))
+        if vol_ratio and vol_ratio > 1.5:
+            components.append(("Hacim", 75, f"{vol_ratio:.1f}x ortalama"))
+        elif vol_ratio:
+            components.append(("Hacim", 50, f"{vol_ratio:.1f}x ortalama"))
+
+        if components:
+            tech_score = sum(c[1] for c in components) / len(components)
+
+        result = {
+            "price": price, "ma50": ma50_val, "ma200": ma200_val,
+            "rsi": rsi_val, "macd": macd_val, "macd_signal": signal_val,
+            "macd_hist": macd_hist, "macd_bullish": macd_bullish,
+            "macd_cross": macd_cross, "cross_signal": cross_signal,
+            "bb_pos": bb_pos,
+            "high_52w": high_52w, "low_52w": low_52w,
+            "pct_from_high": pct_from_high, "pct_from_low": pct_from_low,
+            "vol_ratio": vol_ratio, "tech_score": round(tech_score, 1),
+            "components": components,
+            "df": df,  # chart icin sakla
+        }
+        TECH_CACHE[symbol] = result
+        return result
+    except Exception as e:
+        log.warning(f"Technical {symbol}: {e}")
+        return None
+
+# ================================================================
+# CHART GENERATOR (V5)
+# ================================================================
+def generate_chart(symbol, tech_data):
+    """6 aylik grafik + MA50/200, PNG bytes dondur"""
+    if not CHART_AVAILABLE or tech_data is None:
+        return None
+    try:
+        df = tech_data["df"].tail(130)  # ~6 ay
+        if len(df) < 20:
+            return None
+
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 6), height_ratios=[3, 1],
+                                         gridspec_kw={"hspace": 0.05})
+        fig.patch.set_facecolor("#0d1117")
+        ax1.set_facecolor("#0d1117")
+        ax2.set_facecolor("#0d1117")
+
+        dates = df.index
+        close = df["Close"]
+        volume = df["Volume"]
+
+        # Fiyat
+        ax1.plot(dates, close, color="#58a6ff", linewidth=1.5, label="Fiyat")
+
+        # MA50
+        ma50 = close.rolling(50).mean()
+        ax1.plot(dates, ma50, color="#f0883e", linewidth=1, alpha=0.8, label="MA50")
+
+        # MA200 (varsa)
+        if len(close) >= 200 or tech_data.get("ma200"):
+            full_close = tech_data["df"]["Close"]
+            ma200 = full_close.rolling(200).mean().reindex(df.index)
+            valid = ma200.dropna()
+            if len(valid) > 5:
+                ax1.plot(valid.index, valid, color="#da3633", linewidth=1, alpha=0.8, label="MA200")
+
+        # 52W high/low cizgiler
+        if tech_data.get("high_52w"):
+            ax1.axhline(y=tech_data["high_52w"], color="#3fb950", linestyle="--", alpha=0.4, linewidth=0.8)
+        if tech_data.get("low_52w"):
+            ax1.axhline(y=tech_data["low_52w"], color="#da3633", linestyle="--", alpha=0.4, linewidth=0.8)
+
+        ticker = base_ticker(symbol)
+        price = tech_data["price"]
+        rsi = tech_data.get("rsi")
+        score = tech_data.get("tech_score", 50)
+        ax1.set_title(f"{ticker}  {price:.2f}  |  Teknik: {score}/100  |  RSI: {rsi:.0f}" if rsi else f"{ticker}  {price:.2f}",
+                      color="white", fontsize=12, fontweight="bold", pad=10)
+        ax1.legend(loc="upper left", fontsize=8, facecolor="#161b22", edgecolor="#30363d",
+                   labelcolor="white")
+        ax1.tick_params(colors="gray", labelsize=8)
+        ax1.grid(True, alpha=0.1, color="gray")
+        ax1.set_ylabel("")
+        ax1.xaxis.set_major_formatter(mdates.DateFormatter("%b"))
+
+        # Hacim
+        colors = ["#3fb950" if c >= o else "#da3633"
+                  for c, o in zip(df["Close"], df["Open"])]
+        ax2.bar(dates, volume, color=colors, alpha=0.6, width=0.8)
+        ax2.tick_params(colors="gray", labelsize=7)
+        ax2.grid(True, alpha=0.1, color="gray")
+        ax2.set_ylabel("")
+        ax2.xaxis.set_major_formatter(mdates.DateFormatter("%b"))
+
+        for ax in [ax1, ax2]:
+            for spine in ax.spines.values():
+                spine.set_color("#30363d")
+
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=120, bbox_inches="tight",
+                    facecolor="#0d1117", edgecolor="none")
+        plt.close(fig)
+        buf.seek(0)
+        return buf.getvalue()
+    except Exception as e:
+        log.warning(f"Chart {symbol}: {e}")
+        return None
+
+# ================================================================
+# AI TRADER SUMMARY (V5)
+# ================================================================
+AI_CACHE = TTLCache(maxsize=200, ttl=7200)  # 2 saat cache
+
+def ai_trader_summary(r, tech):
+    """GPT-4o-mini ile 2-3 cumle yatirim tezi"""
+    if not AI_AVAILABLE or not OPENAI_KEY:
+        return None
+    cache_key = f"{r['symbol']}_{r['overall']}"
+    if cache_key in AI_CACHE:
+        return AI_CACHE[cache_key]
+    try:
+        s = r["scores"]
+        m = r["metrics"]
+        tech_str = ""
+        if tech:
+            tech_str = (
+                f"Teknik: RSI={tech.get('rsi', '?'):.0f}, "
+                f"{'MA50 uzerinde' if tech.get('price', 0) > (tech.get('ma50') or 0) else 'MA50 altinda'}, "
+                f"MACD {'bullish' if tech.get('macd_bullish') else 'bearish'}, "
+                f"52W high'a {abs(tech.get('pct_from_high', 0)):.0f}% mesafe"
+            )
+        prompt = (
+            f"Sen BIST trader'isin. 2-3 cumle ile yatirim tezi yaz. Turkce.\n"
+            f"Hisse: {r['ticker']} ({r['name']})\n"
+            f"Stil: {r['style']} | Genel Skor: {r['overall']}/100\n"
+            f"Value:{s['value']:.0f} Quality:{s['quality']:.0f} Growth:{s['growth']:.0f} "
+            f"Balance:{s['balance']:.0f} Moat:{s['moat']:.0f}\n"
+            f"P/E:{fmt_num(m.get('pe'))} ROE:{fmt_pct(m.get('roe'))} "
+            f"Net Borc/EBITDA:{fmt_num(m.get('net_debt_ebitda'))}\n"
+            f"{tech_str}\n"
+            f"Pozitifler: {', '.join(r['positives'])}\n"
+            f"Negatifler: {', '.join(r['negatives'])}\n\n"
+            f"SADECE 2-3 cumle yaz. Kisa, net, aksiyon odakli. Hic baska birsey yazma."
+        )
+        client = OpenAI(api_key=OPENAI_KEY)
+        resp = client.chat.completions.create(
+            model=SCORING_MODEL, max_tokens=200, temperature=0.4,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        text = resp.choices[0].message.content.strip()
+        AI_CACHE[cache_key] = text
+        return text
+    except Exception as e:
+        log.warning(f"AI summary: {e}")
+        return None
+
+# ================================================================
+# CROSS HUNTER — Background Scanner (V5)
+# ================================================================
+class CrossHunter:
+    def __init__(self):
+        self.last_scan = 0
+        self.SCAN_INTERVAL = 10800  # 3 saat
+        self.prev_signals = {}  # {ticker: set of signal names}
+        self.enabled = True
+
+    def scan_all(self):
+        """UNIVERSE'u tara, YENi sinyalleri dondur"""
+        new_signals = defaultdict(list)
+        all_signals = {}
+        for t in UNIVERSE:
+            try:
+                symbol = normalize_symbol(t)
+                tech = compute_technical(symbol)
+                if not tech:
+                    continue
+                signals = set()
+                if tech.get("cross_signal") == "GOLDEN_CROSS":
+                    signals.add("Golden Cross")
+                if tech.get("cross_signal") == "DEATH_CROSS":
+                    signals.add("Death Cross")
+                if tech.get("rsi") and tech["rsi"] > 70:
+                    signals.add(f"RSI Asiri Alim ({tech['rsi']:.0f})")
+                if tech.get("rsi") and tech["rsi"] < 30:
+                    signals.add(f"RSI Asiri Satim ({tech['rsi']:.0f})")
+                if tech.get("macd_cross") == "BULLISH":
+                    signals.add("MACD Bullish Cross")
+                if tech.get("macd_cross") == "BEARISH":
+                    signals.add("MACD Bearish Cross")
+                if tech.get("bb_pos") == "ABOVE":
+                    signals.add("BB Ust Band Kirilim")
+                if tech.get("bb_pos") == "BELOW":
+                    signals.add("BB Alt Band Kirilim")
+
+                all_signals[t] = signals
+
+                # Sadece YENI sinyaller
+                prev = self.prev_signals.get(t, set())
+                for sig in signals:
+                    if sig not in prev:
+                        new_signals[sig].append(t)
+            except Exception as e:
+                log.debug(f"CrossHunter {t}: {e}")
+
+        self.prev_signals = all_signals
+        self.last_scan = time.time()
+        return new_signals
+
+    def format_report(self, new_signals):
+        """Telegram mesaji olustur"""
+        if not new_signals:
+            return None
+        now = dt.datetime.now(dt.timezone.utc)
+        lines = [
+            "━━━━━━━━━━━━━━━━━━━━━━",
+            f"🔥 <b>CROSS HUNTER</b>  —  {now.strftime('%d.%m %H:%M')} UTC",
+            "━━━━━━━━━━━━━━━━━━━━━━",
+            "",
+        ]
+        order = ["Golden Cross", "Death Cross",
+                 "MACD Bullish Cross", "MACD Bearish Cross",
+                 "BB Ust Band Kirilim", "BB Alt Band Kirilim"]
+        for sig_name in order:
+            if sig_name in new_signals:
+                icon = "🟢" if "Golden" in sig_name or "Bullish" in sig_name else "🔴" if "Death" in sig_name or "Bearish" in sig_name else "🟡"
+                tickers = ", ".join([f"<code>{t}</code>" for t in new_signals[sig_name]])
+                lines.append(f"{icon} <b>{sig_name}:</b> {tickers}")
+        # RSI sinyalleri
+        for sig_name, tickers in new_signals.items():
+            if "RSI" in sig_name:
+                icon = "🟢" if "Satim" in sig_name else "🔴"
+                tlist = ", ".join([f"<code>{t}</code>" for t in tickers])
+                lines.append(f"{icon} <b>{sig_name}:</b> {tlist}")
+        # BB sinyalleri (order'da olmayanlar)
+        for sig_name, tickers in new_signals.items():
+            if sig_name not in order and "RSI" not in sig_name:
+                tlist = ", ".join([f"<code>{t}</code>" for t in tickers])
+                lines.append(f"🟡 <b>{sig_name}:</b> {tlist}")
+        lines.append("")
+        total = sum(len(v) for v in new_signals.values())
+        lines.append(f"Toplam: {total} yeni sinyal | {len(UNIVERSE)} hisse tarandi")
+        return "\n".join(lines)
+
+cross_hunter = CrossHunter()
+
+# ================================================================
+# HELPER: Score Emoji (V5)
+# ================================================================
+def score_emoji(val):
+    if val is None: return "⚫"
+    if val >= 80: return "🟢"
+    if val >= 65: return "🟡"
+    return "🔴"
+
+def trend_arrow(cur, prev):
+    """Onceki donemle karsilastirma oku"""
+    cur, prev = safe_num(cur), safe_num(prev)
+    if cur is None or prev is None: return ""
+    diff = cur - prev
+    if abs(diff) < 0.001: return " →"
+    return " ↑" if diff > 0 else " ↓"
+
+# ================================================================
+# RENDERERS (V5)
 # ================================================================
 def header_line(r):
     return f"<b>{APP_NAME} [{BOT_VERSION}]</b>\n<b>{html_escape(r['ticker'])} — Score: {r['overall']}/100</b>"
 
-def overview_text(r):
+def overview_text(r, tech=None, ai_text=None):
     s, m, L = r["scores"], r["metrics"], r["legendary"]
-    lines = [
-        header_line(r), html_escape(r["name"]),
-        f"Style: {html_escape(r['style'])}  |  Confidence: {r['confidence']}/100",
-        f"Buffett: {html_escape(L['buffett_filter'])}  |  Graham: {html_escape(L['graham_filter'])}",
-    ]
+    lines = [header_line(r), html_escape(r["name"])]
+
+    # Sector (V5)
+    sector = m.get("sector") or ""
+    industry = m.get("industry") or ""
+    if sector:
+        si = html_escape(sector)
+        if industry: si += f" · {html_escape(industry)}"
+        lines.append(si)
+
+    lines.append(f"Style: {html_escape(r['style'])}  |  Confidence: {r['confidence']}/100")
+    lines.append(f"Buffett: {html_escape(L['buffett_filter'])}  |  Graham: {html_escape(L['graham_filter'])}")
+
     if m.get("price") is not None:
-        lines.append(f"Price: {fmt_num(m['price'])} {html_escape(r['currency'])}")
-    lines += ["", "<b>Scorecard</b>",
-        f"Value: {s['value']} | Quality: {s['quality']} | Growth: {s['growth']}",
-        f"Balance: {s['balance']} | Earnings: {s['earnings']} | Moat: {s['moat']}",
-        "", "<b>Positives</b>", *[f"+ {html_escape(x)}" for x in r["positives"]],
-        "", "<b>Negatives</b>", *[f"- {html_escape(x)}" for x in r["negatives"]],
-        "", "Tap buttons for details.",
-    ]
+        price_line = f"Price: {fmt_num(m['price'])} {html_escape(r['currency'])}"
+        if tech and tech.get("high_52w") and tech.get("low_52w"):
+            price_line += f"  (52W: {fmt_num(tech['low_52w'])}–{fmt_num(tech['high_52w'])})"
+        lines.append(price_line)
+
+    # Skorlar + emoji (V5)
+    lines += ["", "<b>Scorecard</b>"]
+    lines.append(
+        f"{score_emoji(s['value'])} Val:{s['value']:.0f} | "
+        f"{score_emoji(s['quality'])} Qlt:{s['quality']:.0f} | "
+        f"{score_emoji(s['growth'])} Grw:{s['growth']:.0f}"
+    )
+    lines.append(
+        f"{score_emoji(s['balance'])} Bal:{s['balance']:.0f} | "
+        f"{score_emoji(s['earnings'])} Ear:{s['earnings']:.0f} | "
+        f"{score_emoji(s['moat'])} Moat:{s['moat']:.0f}"
+    )
+    if tech:
+        ts = tech.get("tech_score", 50)
+        rsi_v = tech.get("rsi")
+        lines.append(f"{score_emoji(ts)} Teknik:{ts:.0f}" + (f" | RSI:{rsi_v:.0f}" if rsi_v else ""))
+
+    # Trend oklari (V5)
+    trends = []
+    if m.get("gross_margin") is not None and m.get("gross_margin_prev") is not None:
+        trends.append(f"Gross{trend_arrow(m['gross_margin'], m['gross_margin_prev'])}")
+    if m.get("roa") is not None and m.get("roa_prev") is not None:
+        trends.append(f"ROA{trend_arrow(m['roa'], m['roa_prev'])}")
+    if m.get("revenue_growth") is not None:
+        trends.append(f"Rev {'↑' if m['revenue_growth'] > 0 else '↓'}")
+    if trends:
+        lines.append("Trend: " + "  ".join(trends))
+
+    lines += ["", "<b>+</b> " + " / ".join(r["positives"])]
+    lines.append("<b>−</b> " + " / ".join(r["negatives"]))
+
+    if ai_text:
+        lines += ["", f"🤖 <i>{html_escape(ai_text)}</i>"]
+
     return "\n".join(lines)
 
 def value_text(r):
@@ -549,7 +983,46 @@ def risks_text(r):
     return "\n".join([f"<b>Risks [{BOT_VERSION}] — {html_escape(r['ticker'])}</b>",
         *[f"- {html_escape(x)}" for x in r["negatives"]]])
 
-VIEW_RENDERERS = {"overview": overview_text, "value": value_text, "quality": quality_text,
+def technical_text(r, tech=None):
+    """V5: Teknik analiz detay"""
+    t = base_ticker(r["symbol"])
+    if not tech:
+        return f"<b>Teknik [{BOT_VERSION}] — {html_escape(t)}</b>\n\nTeknik veri alinamadi."
+    lines = [f"<b>Teknik [{BOT_VERSION}] — {html_escape(t)}</b>", ""]
+    lines.append(f"<b>Teknik Skor: {score_emoji(tech['tech_score'])} {tech['tech_score']:.0f}/100</b>")
+    lines.append("")
+    # Components
+    for name, val, desc in tech.get("components", []):
+        lines.append(f"{score_emoji(val)} {name}: {desc}")
+    lines.append("")
+    # RSI + MACD
+    if tech.get("rsi"):
+        rsi_label = "Asiri Alim" if tech["rsi"] > 70 else "Asiri Satim" if tech["rsi"] < 30 else "Normal"
+        lines.append(f"RSI(14): <b>{tech['rsi']:.1f}</b> ({rsi_label})")
+    if tech.get("macd") is not None:
+        lines.append(f"MACD: {tech['macd']:.4f} | Signal: {tech['macd_signal']:.4f} | {'Bullish' if tech['macd_bullish'] else 'Bearish'}")
+    # MA
+    if tech.get("ma50"):
+        lines.append(f"MA50: {tech['ma50']:.2f} | {'Fiyat uzerinde ✓' if tech['price'] > tech['ma50'] else 'Fiyat altinda ✗'}")
+    if tech.get("ma200"):
+        lines.append(f"MA200: {tech['ma200']:.2f} | {'Fiyat uzerinde ✓' if tech['price'] > tech['ma200'] else 'Fiyat altinda ✗'}")
+    # Cross
+    if tech.get("cross_signal"):
+        icon = "🟢" if tech["cross_signal"] == "GOLDEN_CROSS" else "🔴"
+        lines.append(f"{icon} {tech['cross_signal'].replace('_',' ')}")
+    if tech.get("macd_cross"):
+        icon = "🟢" if tech["macd_cross"] == "BULLISH" else "🔴"
+        lines.append(f"{icon} MACD {tech['macd_cross']} Cross")
+    # 52W
+    if tech.get("high_52w"):
+        lines.append(f"\n52W Range: {tech['low_52w']:.2f} — {tech['high_52w']:.2f}")
+        lines.append(f"High'a mesafe: {tech['pct_from_high']:.1f}% | Low'dan mesafe: +{tech['pct_from_low']:.1f}%")
+    # Hacim
+    if tech.get("vol_ratio"):
+        lines.append(f"Hacim: {tech['vol_ratio']:.1f}x ortalama")
+    return "\n".join(lines)
+
+VIEW_RENDERERS = {"value": value_text, "quality": quality_text,
     "growth": growth_text, "balance": balance_text, "earnings": earnings_text,
     "legendary": legendary_text, "risks": risks_text}
 
@@ -561,12 +1034,13 @@ def stock_keyboard(ticker):
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("Overview", callback_data=f"view|{t}|overview"),
          InlineKeyboardButton("Value", callback_data=f"view|{t}|value"),
-         InlineKeyboardButton("Quality", callback_data=f"view|{t}|quality")],
-        [InlineKeyboardButton("Growth", callback_data=f"view|{t}|growth"),
-         InlineKeyboardButton("Balance", callback_data=f"view|{t}|balance"),
-         InlineKeyboardButton("Earnings", callback_data=f"view|{t}|earnings")],
-        [InlineKeyboardButton("Legendary", callback_data=f"view|{t}|legendary"),
-         InlineKeyboardButton("Risks", callback_data=f"view|{t}|risks"),
+         InlineKeyboardButton("Quality", callback_data=f"view|{t}|quality"),
+         InlineKeyboardButton("Growth", callback_data=f"view|{t}|growth")],
+        [InlineKeyboardButton("Balance", callback_data=f"view|{t}|balance"),
+         InlineKeyboardButton("Earnings", callback_data=f"view|{t}|earnings"),
+         InlineKeyboardButton("Legendary", callback_data=f"view|{t}|legendary"),
+         InlineKeyboardButton("Teknik", callback_data=f"view|{t}|technical")],
+        [InlineKeyboardButton("📈 Chart", callback_data=f"chart|{t}"),
          InlineKeyboardButton("Top 10", callback_data="top10")],
     ])
 
@@ -585,7 +1059,7 @@ def top10_text_render():
     stamp = TOP10_CACHE["asof"].strftime("%d.%m.%Y %H:%M")
     lines = [f"<b>BIST Top 10 [{BOT_VERSION}] — {stamp}</b>", ""]
     for i, item in enumerate(items[:10], 1):
-        lines.append(f"{i}. <b>{item['ticker']}</b> — {item['overall']}/100 ({html_escape(item['style'])})")
+        lines.append(f"{i}. {score_emoji(item['overall'])} <b>{item['ticker']}</b> — {item['overall']}/100 ({html_escape(item['style'])})")
     lines.append("\nTicker'a tikla detay gor.")
     return "\n".join(lines)
 
@@ -616,8 +1090,23 @@ async def show_ticker(target, ticker, view="overview", try_edit=False):
         m = r["metrics"]
         if m.get("price") is None and m.get("market_cap") is None and m.get("pe") is None:
             raise ValueError("No data")
-        text = VIEW_RENDERERS.get(view, overview_text)(r)
+
         markup = stock_keyboard(r["ticker"])
+
+        # Overview: teknik + AI de ekle (V5)
+        if view == "overview":
+            tech = await asyncio.to_thread(compute_technical, symbol)
+            ai_text = None
+            if AI_AVAILABLE and OPENAI_KEY:
+                ai_text = await asyncio.to_thread(ai_trader_summary, r, tech)
+            text = overview_text(r, tech=tech, ai_text=ai_text)
+        elif view == "technical":
+            tech = await asyncio.to_thread(compute_technical, symbol)
+            text = technical_text(r, tech=tech)
+        else:
+            renderer = VIEW_RENDERERS.get(view, value_text)
+            text = renderer(r)
+
         if try_edit:
             try:
                 await target.edit_message_text(text=text, parse_mode=ParseMode.HTML, reply_markup=markup)
@@ -633,14 +1122,37 @@ async def show_ticker(target, ticker, view="overview", try_edit=False):
         if hasattr(target, "message") and target.message:
             await target.message.reply_text(msg, parse_mode=ParseMode.HTML)
 
+async def send_chart(query, ticker):
+    """Chart gonder — photo olarak (V5)"""
+    symbol = normalize_symbol(ticker)
+    try:
+        tech = await asyncio.to_thread(compute_technical, symbol)
+        if not tech:
+            await query.answer("Teknik veri alinamadi", show_alert=True)
+            return
+        chart_bytes = await asyncio.to_thread(generate_chart, symbol, tech)
+        if chart_bytes:
+            await query.message.reply_photo(
+                photo=chart_bytes,
+                caption=f"📈 {base_ticker(ticker)} | Teknik: {tech.get('tech_score', 50):.0f}/100 | RSI: {tech.get('rsi', 0):.0f}",
+                reply_markup=stock_keyboard(ticker)
+            )
+        else:
+            await query.answer("Chart olusturulamadi", show_alert=True)
+    except Exception as e:
+        log.warning(f"send_chart: {e}")
+        await query.answer("Chart hatasi", show_alert=True)
+
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed_chat(update): return
     await update.message.reply_text(
         f"<b>{APP_NAME} [{BOT_VERSION}]</b>\n\n"
         "Ticker yaz: <code>ASELS</code> veya <code>TKFEN</code>\n"
         "/top10 — En iyi 10 hisse\n"
+        "/cross — Cross Hunter (teknik sinyal taramas)\n"
         "/ping — Bot canli mi\n"
-        "/help — Yardim",
+        "/help — Yardim\n\n"
+        "V5: 📈 Chart, 🤖 AI Ozet, 🟢🟡🔴 Emoji Skorlar, Teknik Analiz",
         parse_mode=ParseMode.HTML)
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -690,6 +1202,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(top10_text_render(), parse_mode=ParseMode.HTML, reply_markup=top10_keyboard(TOP10_CACHE["items"]))
         except Exception: pass
         return
+    # V5: Chart
+    if data.startswith("chart|"):
+        ticker = data.split("|", 1)[1]
+        await send_chart(query, ticker)
+        return
     if data.startswith("view|"):
         try:
             _, ticker, view = data.split("|", 2)
@@ -697,15 +1214,49 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             log.exception("callback: %s", data)
 
+# V5: /cross komutu
+async def cross_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed_chat(update): return
+    await update.message.reply_text("🔍 Cross Hunter taraniyor...")
+    new_signals = await asyncio.to_thread(cross_hunter.scan_all)
+    report = cross_hunter.format_report(new_signals)
+    if report:
+        await update.message.reply_text(report, parse_mode=ParseMode.HTML)
+    else:
+        await update.message.reply_text("Simdilik yeni sinyal yok. Onceki tarama ile ayni.", parse_mode=ParseMode.HTML)
+
 # ================================================================
 # MAIN
 # ================================================================
+async def cross_hunter_loop(app):
+    """3 saatte bir Cross Hunter calistir, yeni sinyal varsa mesaj at"""
+    await asyncio.sleep(60)  # 1dk bekle, bot baslasin
+    log.info("CrossHunter background task started")
+    while True:
+        try:
+            if cross_hunter.enabled and CHAT_ID:
+                new_signals = await asyncio.to_thread(cross_hunter.scan_all)
+                report = cross_hunter.format_report(new_signals)
+                if report:
+                    await app.bot.send_message(
+                        chat_id=int(CHAT_ID),
+                        text=report,
+                        parse_mode=ParseMode.HTML
+                    )
+                    log.info(f"CrossHunter: {sum(len(v) for v in new_signals.values())} yeni sinyal gonderildi")
+                else:
+                    log.info("CrossHunter: yeni sinyal yok")
+        except Exception as e:
+            log.warning(f"CrossHunter loop: {e}")
+        await asyncio.sleep(cross_hunter.SCAN_INTERVAL)
+
 async def main():
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("ping", ping_cmd))
     app.add_handler(CommandHandler("top10", top10_cmd))
+    app.add_handler(CommandHandler("cross", cross_cmd))
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
@@ -714,6 +1265,13 @@ async def main():
     await app.updater.start_polling(drop_pending_updates=True, allowed_updates=["message", "callback_query"])
 
     log.info(f"BERKAY FUNDAMENTALS [{BOT_VERSION}] BASLADI! Universe: {len(UNIVERSE)} hisse")
+    log.info(f"  AI: {'aktif (' + SCORING_MODEL + ')' if AI_AVAILABLE and OPENAI_KEY else 'pasif'}")
+    log.info(f"  Chart: {'aktif' if CHART_AVAILABLE else 'pasif (pip install matplotlib)'}")
+    log.info(f"  CrossHunter: {'aktif (her 3 saat)' if cross_hunter.enabled else 'pasif'}")
+
+    # CrossHunter background task
+    asyncio.create_task(cross_hunter_loop(app))
+
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
