@@ -1,5 +1,5 @@
 # ================================================================
-# BERKAY TERMINATOR v3.3 — RAILWAY
+# BERKAY TERMINATOR v3.4 — RAILWAY
 # v3.2 fixes + Radar + Watchlist + Dynamic Thresh + FA PreCache
 # ================================================================
 #
@@ -637,15 +637,26 @@ class XSentimentEngine:
     async def init_api(self):
         if not TWSCRAPE_AVAILABLE:
             return False
+        if self._no_accounts:
+            return False
         if self.api is None:
             try:
+                # twscrape loglarini sustur — "No active accounts" spam'i engelle
+                import logging as _logging
+                tw_logger = _logging.getLogger("twscrape")
+                old_level = tw_logger.level
+                tw_logger.setLevel(_logging.CRITICAL)
+
                 self.api = TwAPI()
                 await self.api.pool.login_all()
+
+                tw_logger.setLevel(old_level)
                 log.info("twscrape API baslatildi — X Sentiment aktif!")
                 return True
             except Exception as e:
-                log.warning(f"twscrape init: {e}")
+                log.info(f"twscrape devre disi: {e}")
                 self.api = None
+                self._no_accounts = True
                 return False
         return True
 
@@ -918,7 +929,7 @@ async def feedback_kontrol(bot):
                 # /help
                 if txt.strip() == "/help":
                     await bot.send_message(chat_id=chat_id, parse_mode=ParseMode.HTML, text=(
-                        "<b>BERKAY TERMINATOR v3.3</b>\n\n"
+                        "<b>BERKAY TERMINATOR v3.4</b>\n\n"
                         "<b>Piyasa:</b>\n"
                         "/radar — canli fiyatlar\n"
                         "/heat THYAO — X heat skoru\n"
@@ -1762,7 +1773,7 @@ class MacroEngine:
         flag        = "TR" if country == "TR" else "US"
         syms        = "  ".join([f"<code>{s}</code>" for s in ctx[1][:5]]) or "—"
         ozet        = ctx[2]
-        impact_icon = "Cok Yuksek" if impact == "high" else "Orta"
+        impact_icon = "Cok Yuksek" if impact in ("high", "High") else "Orta"
         senaryo     = self.SENARYO.get(event_name)
         senaryo_str = ""
         if senaryo:
@@ -2658,7 +2669,7 @@ async def ana_dongu():
         chat_id=CHAT_ID,
         text=(
             "━━━━━━━━━━━━━━━━━━━━━━\n"
-            "🤖 <b>BERKAY TERMINATOR v3.3</b>\n"
+            "🤖 <b>BERKAY TERMINATOR v3.4</b>\n"
             f"  {ist_now().strftime('%d.%m.%Y %H:%M')} Istanbul\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n\n"
 
@@ -2694,12 +2705,13 @@ async def ana_dongu():
             "FA botu ayri calisiyor\n"
             "Dinamik esik (sessizse otomatik duser)\n"
             f"TZ: Istanbul | AI: {SCORING_MODEL}\n"
+            "Takvim: Forex Factory (free XML)\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n"
             "Izleme basladi..."
         ),
         parse_mode=ParseMode.HTML
     )
-    log.info("TERMINATOR v3.3 BASLADI!")
+    log.info("TERMINATOR v3.4 BASLADI!")
 
 
 
@@ -2922,22 +2934,22 @@ async def ana_dongu():
 
 
 
-            # Sabah brifing (09:45)
-            if simdi.hour == 9 and simdi.minute == 45:
+            # Sabah brifing (09:45-09:50 arasi)
+            if simdi.hour == 9 and 45 <= simdi.minute <= 50:
                 bugun_str = simdi.strftime("%Y%m%d")
                 if state.son_sabah != bugun_str:
                     state.son_sabah = bugun_str
                     await sabah_brifing(bot)
 
-            # Oglen brifing (13:00)
-            if simdi.hour == 13 and simdi.minute == 0:
+            # Oglen brifing (13:00-13:05 arasi)
+            if simdi.hour == 13 and 0 <= simdi.minute <= 5:
                 bugun_str = simdi.strftime("%Y%m%d")
                 if state.son_oglen != bugun_str:
                     state.son_oglen = bugun_str
                     await oglen_brifing(bot)
 
-            # Aksam ozeti (17:45)
-            if simdi.hour == 17 and simdi.minute == 45:
+            # Aksam ozeti (17:45-17:50 arasi)
+            if simdi.hour == 17 and 45 <= simdi.minute <= 50:
                 bugun_str = simdi.strftime("%Y%m%d")
                 if state.son_aksam != bugun_str:
                     state.son_aksam = bugun_str
