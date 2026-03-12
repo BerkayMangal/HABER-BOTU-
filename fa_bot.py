@@ -177,12 +177,18 @@ def fetch_raw(symbol):
 def compute_piotroski(m):
     pts, used = 0, 0
     tests = [
+        # Profitability (4 tests)
         (m.get("roa", 0) > 0) if m.get("roa") is not None else None,
         (m.get("operating_cf", 0) > 0) if m.get("operating_cf") is not None else None,
         (m.get("roa", 0) > m.get("roa_prev", 0)) if (m.get("roa") is not None and m.get("roa_prev") is not None) else None,
         (m.get("operating_cf", 0) > m.get("net_income", 0)) if (m.get("operating_cf") is not None and m.get("net_income") is not None) else None,
+        # Leverage (3 tests)
         (m.get("current_ratio", 0) > m.get("current_ratio_prev", 0)) if (m.get("current_ratio") is not None and m.get("current_ratio_prev") is not None) else None,
         (m.get("share_change", 1) <= 0) if m.get("share_change") is not None else None,
+        # V5.1: 9th test — leverage decrease (debt/assets azaldi mi)
+        ((m.get("total_debt",0)/max(m.get("total_assets",1),1)) < (m.get("total_debt_prev",0)/max(m.get("total_assets_prev",1),1)))
+            if (m.get("total_debt") is not None and m.get("total_assets") is not None and m.get("total_debt_prev") is not None and m.get("total_assets_prev") is not None) else None,
+        # Efficiency (2 tests)
         (m.get("gross_margin", 0) > m.get("gross_margin_prev", 0)) if (m.get("gross_margin") is not None and m.get("gross_margin_prev") is not None) else None,
         (m.get("asset_turnover", 0) > m.get("asset_turnover_prev", 0)) if (m.get("asset_turnover") is not None and m.get("asset_turnover_prev") is not None) else None,
     ]
@@ -360,38 +366,47 @@ def compute_metrics(symbol):
 # SCORING
 # ================================================================
 def score_value(m):
+    # V5.1: BIST-calibrated + EV/Sales eklendi
+    ev_sales = None
+    if m.get("market_cap") and m.get("total_debt") and m.get("cash") and m.get("revenue"):
+        ev = m["market_cap"] + (m["total_debt"] or 0) - (m["cash"] or 0)
+        if m["revenue"] > 0:
+            ev_sales = ev / m["revenue"]
     return avg([
-        score_lower(m.get("pe"), 8, 12, 18, 30) if (m.get("pe") or 0) > 0 else None,
-        score_lower(m.get("pb"), 1, 1.8, 3, 5) if (m.get("pb") or 0) > 0 else None,
-        score_lower(m.get("ev_ebitda"), 5, 8, 12, 18) if (m.get("ev_ebitda") or 0) > 0 else None,
+        score_lower(m.get("pe"), 6, 10, 16, 25) if (m.get("pe") or 0) > 0 else None,  # was 8,12,18,30
+        score_lower(m.get("pb"), 0.8, 1.5, 2.5, 4.5) if (m.get("pb") or 0) > 0 else None,  # was 1,1.8,3,5
+        score_lower(m.get("ev_ebitda"), 4, 7, 11, 16) if (m.get("ev_ebitda") or 0) > 0 else None,  # was 5,8,12,18
+        score_lower(ev_sales, 0.5, 1.2, 2.5, 5.0) if ev_sales is not None and ev_sales > 0 else None,  # NEW
         score_higher(m.get("fcf_yield"), 0, 0.02, 0.05, 0.08),
         score_higher(m.get("margin_safety"), -0.2, 0, 0.15, 0.30),
     ])
 
 def score_quality(m):
+    # V5.1: BIST-calibrated thresholds (EM ortami, yuksek faiz)
     return avg([
-        score_higher(m.get("roe"), 0.02, 0.08, 0.15, 0.25),
-        score_higher(m.get("roic"), 0.02, 0.08, 0.12, 0.20),
-        score_higher(m.get("gross_margin"), 0.10, 0.20, 0.30, 0.45),
-        score_higher(m.get("operating_margin"), 0.03, 0.08, 0.15, 0.25),
-        score_higher(m.get("net_margin"), 0.01, 0.05, 0.10, 0.18),
+        score_higher(m.get("roe"), 0.01, 0.06, 0.12, 0.20),       # was 2,8,15,25
+        score_higher(m.get("roic"), 0.01, 0.06, 0.10, 0.16),      # was 2,8,12,20
+        score_higher(m.get("gross_margin"), 0.08, 0.15, 0.25, 0.40),  # was 10,20,30,45
+        score_higher(m.get("operating_margin"), 0.02, 0.06, 0.12, 0.20),  # was 3,8,15,25
+        score_higher(m.get("net_margin"), 0.005, 0.03, 0.08, 0.15),  # was 1,5,10,18
     ])
 
 def score_growth(m):
+    # V5.1: BIST'te enflasyonlu ortam — nominal buyume daha yuksek
     return avg([
-        score_higher(m.get("revenue_growth"), -0.05, 0.03, 0.10, 0.20),
-        score_higher(m.get("eps_growth"), -0.10, 0.03, 0.10, 0.20),
-        score_higher(m.get("ebitda_growth"), -0.05, 0.03, 0.10, 0.18),
-        score_lower(m.get("peg"), 0.6, 1.0, 1.8, 3.0) if (m.get("peg") or 0) > 0 else None,
+        score_higher(m.get("revenue_growth"), -0.05, 0.05, 0.15, 0.30),  # was 3,10,20 — BIST'te enflasyon etkisi
+        score_higher(m.get("eps_growth"), -0.10, 0.05, 0.15, 0.30),     # was 3,10,20
+        score_higher(m.get("ebitda_growth"), -0.05, 0.05, 0.12, 0.25),  # was 3,10,18
+        score_lower(m.get("peg"), 0.5, 1.0, 1.8, 3.0) if (m.get("peg") or 0) > 0 else None,
     ])
 
 def score_balance(m):
     nde = m.get("net_debt_ebitda")
     nde_s = 100.0 if nde is not None and nde < 0 else score_lower(nde, 0.5, 1.5, 2.5, 4.0)
     return avg([nde_s,
-        score_lower(m.get("debt_equity"), 20, 60, 120, 250),
-        score_higher(m.get("current_ratio"), 0.7, 1.0, 1.5, 2.2),
-        score_higher(m.get("interest_coverage"), 1.0, 2.0, 5.0, 10.0),
+        score_lower(m.get("debt_equity"), 30, 80, 150, 300),   # was 20,60,120,250 — BIST'te biraz daha toleransli
+        score_higher(m.get("current_ratio"), 0.8, 1.1, 1.5, 2.2),  # was 0.7,1.0,1.5,2.2
+        score_higher(m.get("interest_coverage"), 1.5, 3.0, 6.0, 12.0),  # was 1,2,5,10 — yuksek faiz ortaminda daha siki
         score_higher(m.get("altman_z"), 1.2, 1.8, 3.0, 4.5),
     ])
 
@@ -407,25 +422,39 @@ def score_earnings(m):
     ])
 
 def score_moat(m):
+    # V5.1: Cift sayma kaldirildi — gross_margin+op_margin Quality'de zaten var
+    # Moat: margin STABILITESI + asset turnover + pricing power
     stab = None
     if m.get("gross_margin") is not None and m.get("gross_margin_prev") is not None:
-        stab = score_lower(abs(m["gross_margin"] - m["gross_margin_prev"]), 0, 0.03, 0.07, 0.15)
-    return avg([
-        score_higher(m.get("gross_margin"), 0.10, 0.20, 0.30, 0.45),
-        score_higher(m.get("operating_margin"), 0.03, 0.08, 0.15, 0.25),
-        score_higher(m.get("roic"), 0.02, 0.08, 0.12, 0.20),
-        stab,
-    ])
+        stab = score_lower(abs(m["gross_margin"] - m["gross_margin_prev"]), 0, 0.02, 0.06, 0.12)
+    op_stab = None
+    if m.get("operating_margin") is not None and m.get("roa") is not None and m.get("roa_prev") is not None:
+        op_stab = score_lower(abs(m["roa"] - m["roa_prev"]), 0, 0.02, 0.05, 0.10)
+    # Yuksek gross margin = pricing power
+    pricing = score_higher(m.get("gross_margin"), 0.12, 0.22, 0.35, 0.50) if m.get("gross_margin") else None
+    # Asset turnover trendini moat proxy olarak kullan
+    at_trend = None
+    if m.get("asset_turnover") is not None and m.get("asset_turnover_prev") is not None:
+        at_trend = 75 if m["asset_turnover"] >= m["asset_turnover_prev"] else 35
+    return avg([stab, op_stab, pricing, at_trend])
 
 def score_capital(m):
+    # V5.1: ROIC cift sayma kaldirildi, capex/revenue eklendi
     dil = None
     sc = m.get("share_change")
     if sc is not None:
         dil = 100 if sc <= 0 else score_lower(sc, 0, 0.03, 0.08, 0.20)
+    # Capex/Revenue — dusuk = iyi (az yatirimla cok gelir)
+    capex_rev = None
+    if m.get("operating_cf") and m.get("free_cf") and m.get("revenue"):
+        capex = abs(m["operating_cf"] - m["free_cf"])
+        if m["revenue"] > 0:
+            cr = capex / m["revenue"]
+            capex_rev = score_lower(cr, 0.02, 0.05, 0.10, 0.20)
     return avg([
         score_higher(m.get("dividend_yield"), 0, 0.01, 0.03, 0.06),
         score_higher(m.get("fcf_yield"), 0, 0.02, 0.05, 0.08),
-        score_higher(m.get("roic"), 0.02, 0.08, 0.12, 0.20),
+        capex_rev,
         dil,
     ])
 
@@ -437,11 +466,15 @@ def confidence_score(m):
 
 def style_label(scores):
     v, q, g, moat = scores["value"], scores["quality"], scores["growth"], scores["moat"]
-    if q >= 80 and g >= 65 and v >= 45 and moat >= 65: return "Quality Compounder"
-    if q >= 78 and moat >= 72 and v < 45: return "Premium Compounder"
-    if v >= 78 and scores["balance"] >= 60: return "Deep Value"
-    if g >= 72 and v >= 50: return "GARP"
-    if scores["balance"] < 45 and g >= 55: return "High-Risk Turnaround"
+    bal = scores["balance"]
+    if q >= 75 and g >= 60 and v >= 40 and moat >= 60: return "Quality Compounder"
+    if q >= 72 and moat >= 65 and v < 40: return "Premium Compounder"
+    if v >= 75 and bal >= 55: return "Deep Value"
+    if g >= 70 and v >= 45: return "GARP"
+    if g >= 65 and q >= 55 and v < 45: return "Growth"
+    if v >= 70 and q < 45: return "Value Trap Risk"
+    if bal < 40 and g >= 50: return "High-Risk Turnaround"
+    if scores.get("capital", 50) >= 70 and q >= 55: return "Income / Dividend"
     return "Balanced"
 
 def legendary_labels(m, scores):
@@ -457,20 +490,23 @@ def legendary_labels(m, scores):
 
 def drivers(scores, confidence):
     pos, neg = [], []
-    if scores["quality"] >= 75: pos.append("Good business quality (ROIC / margins strong).")
-    if scores["earnings"] >= 70: pos.append("Cash flow supports earnings.")
-    if scores["balance"] >= 75: pos.append("Balance sheet solid.")
-    if scores["value"] >= 75: pos.append("Looks cheap vs fundamentals.")
-    if scores["moat"] >= 72: pos.append("Signs of pricing power.")
-    if scores["capital"] >= 70: pos.append("Shareholder-friendly capital allocation.")
+    if scores["quality"] >= 70: pos.append("Good business quality (ROIC / margins strong).")
+    if scores["earnings"] >= 65: pos.append("Cash flow supports earnings.")
+    if scores["balance"] >= 70: pos.append("Balance sheet solid.")
+    if scores["value"] >= 70: pos.append("Looks cheap vs fundamentals.")
+    if scores["moat"] >= 65: pos.append("Signs of pricing power / margin stability.")
+    if scores["capital"] >= 65: pos.append("Shareholder-friendly capital allocation.")
+    if scores["growth"] >= 70: pos.append("Strong growth trajectory.")
     if not pos: pos.append("Balanced profile, no single elite category.")
-    if scores["value"] < 45: neg.append("Valuation looks expensive.")
-    if scores["growth"] < 45: neg.append("Growth weak or inconsistent.")
-    if scores["balance"] < 45: neg.append("Debt / liquidity needs watch.")
-    if scores["earnings"] < 45: neg.append("Cash flow trails accounting profits.")
-    if confidence < 70: neg.append("Some metrics missing; treat with caution.")
+    if scores["value"] < 40: neg.append("Valuation looks expensive.")
+    if scores["quality"] < 40: neg.append("Low profitability — margins or ROIC weak.")
+    if scores["growth"] < 40: neg.append("Growth weak or inconsistent.")
+    if scores["balance"] < 40: neg.append("Debt / liquidity needs watch.")
+    if scores["earnings"] < 40: neg.append("Cash flow trails accounting profits.")
+    if scores["moat"] < 35: neg.append("Margin stability weak — no pricing power.")
+    if confidence < 65: neg.append("Some metrics missing; treat with caution.")
     if not neg: neg.append("No major red flag right now.")
-    return pos[:3], neg[:3]
+    return pos[:4], neg[:4]
 
 def analyze_symbol(symbol):
     if symbol in ANALYSIS_CACHE: return ANALYSIS_CACHE[symbol]
@@ -479,17 +515,28 @@ def analyze_symbol(symbol):
         ("value", score_value), ("quality", score_quality), ("growth", score_growth),
         ("balance", score_balance), ("earnings", score_earnings), ("moat", score_moat), ("capital", score_capital),
     ]}
-    overall = 0.22*scores["value"] + 0.22*scores["quality"] + 0.16*scores["growth"] + 0.16*scores["balance"] + 0.10*scores["earnings"] + 0.09*scores["moat"] + 0.05*scores["capital"]
+    # V5.1: EM-adjusted weights — Balance daha onemli (yuksek faiz ortami)
+    overall = (0.20*scores["value"] + 0.22*scores["quality"] + 0.15*scores["growth"]
+              + 0.20*scores["balance"] + 0.10*scores["earnings"] + 0.08*scores["moat"] + 0.05*scores["capital"])
+    # Penalties
     if m.get("equity") is not None and m["equity"] < 0: overall -= 12
     if m.get("net_income") is not None and m["net_income"] < 0: overall -= 8
     if m.get("operating_cf") is not None and m["operating_cf"] < 0: overall -= 8
     if m.get("interest_coverage") is not None and m["interest_coverage"] < 1.5: overall -= 5
     if m.get("beneish_m") is not None and m["beneish_m"] > -1.78: overall -= 5
+    # V5.1: Bonus — net cash pozisyonu (borcsuz sirket)
+    if m.get("total_debt") is not None and m.get("cash") is not None:
+        if m["cash"] > (m["total_debt"] or 0):
+            overall += 3  # net cash bonus
     overall = round(max(1, min(99, overall)), 1)
     confidence = confidence_score(m)
     style = style_label(scores)
     legends = legendary_labels(m, scores)
     pos, neg = drivers(scores, confidence)
+    # V5.1: Bank detection — Altman Z uyarisi
+    is_bank = "bank" in (m.get("industry") or "").lower() or "sigorta" in (m.get("industry") or "").lower()
+    if is_bank and legends.get("altman"):
+        legends["altman"] = "N/A (Banka)"
     r = {
         "symbol": symbol, "ticker": base_ticker(symbol), "name": m["name"], "currency": m["currency"],
         "metrics": m, "scores": scores, "overall": overall, "confidence": confidence,
