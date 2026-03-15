@@ -197,8 +197,8 @@ PETROL_KEYWORDS = [
     "petrol tavan fiyat","oil price cap",
     # Yemen/Husiler
     "husiler","houthi","kizildeniz","red sea tanker","red sea attack",
-    # Suudi Arabistan
-    "suudi arabistan","saudi arabia","aramco","saudi output",
+    # Suudi Arabistan — sadece petrol baglaminda
+    "saudi aramco","saudi output","saudi oil","suudi petrol","suudi uretim",
     # Libya/Irak/Nijerya
     "libya petrol","iraq oil","nigeria oil","libyan output",
     # ABD stok
@@ -597,7 +597,12 @@ market_radar = MarketRadar()
 try:
     from twscrape import API as TwAPI, gather as tw_gather
     TWSCRAPE_AVAILABLE = True
-    # twscrape loglarini KALICI olarak sustur — "No active accounts" spam engelle
+    # twscrape uses LOGURU (not standard logging) — disable it completely
+    try:
+        from loguru import logger as _loguru
+        _loguru.disable("twscrape")
+    except ImportError:
+        pass
     import logging as _tw_logging
     _tw_logging.getLogger("twscrape").setLevel(_tw_logging.CRITICAL)
 except ImportError:
@@ -1516,8 +1521,9 @@ class MacroEngine:
             if resp.status_code != 200:
                 log.warning(f"FF XML status: {resp.status_code}")
                 return []
-            # BeautifulSoup — ET'den daha toleransli
-            soup = BeautifulSoup(resp.content, "html.parser")
+            # CDATA strip + BS4 — en guvenli yol
+            content = resp.text.replace("<![CDATA[", "").replace("]]>", "")
+            soup = BeautifulSoup(content, "html.parser")
             events = []
             for ev in soup.find_all("event"):
                 title   = (ev.find("title").text.strip() if ev.find("title") else "")
@@ -1590,10 +1596,12 @@ class MacroEngine:
         try:
             events = await asyncio.get_running_loop().run_in_executor(None, self._parse_ff_xml)
 
-            if events and state.dongu_sayac % 30 == 1:
+            if events and (state.dongu_sayac <= 2 or state.dongu_sayac % 30 == 1):
                 log.info(f"MacroEngine: {len(events)} USD High/Medium event (Forex Factory)")
                 for ev in events[:5]:
                     log.info(f"  → {ev['title_orig'][:40]} | {ev['ev_time'].strftime('%H:%M')} IST | {ev['impact']} | F:{ev['forecast']}")
+            elif not events and state.dongu_sayac <= 2:
+                log.info("MacroEngine: FF XML 0 event (pazar gunu normal)")
 
             now = ist_now()
             for ev in events:
@@ -1911,15 +1919,14 @@ class MacroEngine:
 macro_engine = MacroEngine()
 
 def ff_takvim_str(target_date_str):
-    """Forex Factory XML'den belirli gun icin High/Medium USD event listesi dondur.
-       target_date_str: 'MM-DD-YYYY' formatinda (FF formatı)
-    """
+    """Forex Factory XML'den belirli gun icin High/Medium USD event listesi dondur."""
     try:
         resp = requests.get(
             "https://nfs.faireconomy.media/ff_calendar_thisweek.xml",
             timeout=15, headers={"User-Agent": "Mozilla/5.0"}
         )
-        soup = BeautifulSoup(resp.content, "html.parser")
+        content = resp.text.replace("<![CDATA[", "").replace("]]>", "")
+        soup = BeautifulSoup(content, "html.parser")
         evs = []
         for ev in soup.find_all("event"):
             date_s   = (ev.find("date").text.strip() if ev.find("date") else "")
@@ -2206,6 +2213,33 @@ def finnhub_genel_cek():
                 out.append(yeni_h(item.get("source","Finnhub"), b, item.get("url",""), "api"))
     except Exception as e:
         log.warning(f"Finnhub genel: {e}")
+    return out
+
+def gdelt_cek():
+    """GDELT API — free, no key needed. Turkey + global EM haberleri."""
+    out = []
+    queries = [
+        ("GDELT TR", "turkey economy OR turkey market OR istanbul stock", "turkey"),
+        ("GDELT EM", "emerging markets OR BRICS OR oil price OR fed rate", "global"),
+    ]
+    for kaynak, query, stream in queries:
+        try:
+            r = requests.get(
+                "https://api.gdeltproject.org/api/v2/doc/doc",
+                params={"query": query, "mode": "artlist", "maxrecords": "8",
+                        "format": "json", "timespan": "4h"},
+                timeout=12, headers=HEADERS
+            )
+            data = r.json()
+            for art in data.get("articles", [])[:6]:
+                title = art.get("title", "").strip()
+                url = art.get("url", "")
+                if title and len(title) > 20:
+                    h = yeni_h(kaynak, title[:260], url, "api")
+                    h["stream"] = "NEWS"
+                    out.append(h)
+        except Exception as e:
+            log.debug(f"GDELT: {e}")
     return out
 
 def finnhub_bist_cek():
@@ -2732,6 +2766,7 @@ async def ana_dongu():
             loop  = asyncio.get_running_loop()
             g_raw = await loop.run_in_executor(None, lambda: rss_cek(RSS_GLOBAL, max_age_hours=4))
             g_raw += await loop.run_in_executor(None, finnhub_genel_cek)
+            g_raw += await loop.run_in_executor(None, gdelt_cek)  # V5: free, no key
             t_raw = await loop.run_in_executor(None, lambda: rss_cek(RSS_TURKEY, max_age_hours=12))
             t_raw += await loop.run_in_executor(None, marketaux_cek)
 
