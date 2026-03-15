@@ -419,7 +419,7 @@ class BotState:
         self.global_thresh    = GLOBAL_THRESH
 
     def dinamik_esik_guncelle(self, gonderilenler):
-        """Son 20dk'da haber yoksa esik dus"""
+        """Son 20dk'da haber yoksa esik dus — ama minimum seviyeye dikkat"""
         if gonderilenler:
             self.son_yuksek_skor_zamani = ist_now()
             self.turkey_thresh = TURKEY_THRESH
@@ -427,8 +427,8 @@ class BotState:
         else:
             dakika = (ist_now() - self.son_yuksek_skor_zamani).total_seconds() / 60
             if dakika > 45:
-                new_tr = max(5, TURKEY_THRESH - 2)
-                new_gl = max(4, GLOBAL_THRESH - 2)
+                new_tr = max(6, TURKEY_THRESH - 1)   # was max(5, -2) — cop haber geciyordu
+                new_gl = max(5, GLOBAL_THRESH - 1)   # was max(4, -2) — F1 haberi fln geciyordu
                 if new_tr != self.turkey_thresh:
                     log.info(f"Dinamik esik dustu: TR={new_tr} GL={new_gl} ({int(dakika)}dk sessiz)")
                 self.turkey_thresh = new_tr
@@ -597,6 +597,9 @@ market_radar = MarketRadar()
 try:
     from twscrape import API as TwAPI, gather as tw_gather
     TWSCRAPE_AVAILABLE = True
+    # twscrape loglarini KALICI olarak sustur — "No active accounts" spam engelle
+    import logging as _tw_logging
+    _tw_logging.getLogger("twscrape").setLevel(_tw_logging.CRITICAL)
 except ImportError:
     TWSCRAPE_AVAILABLE = False
 
@@ -1506,21 +1509,24 @@ class MacroEngine:
     def _parse_ff_xml(self):
         """Forex Factory haftalik XML'i cek ve parse et"""
         try:
-            import xml.etree.ElementTree as ET
             resp = requests.get(
                 "https://nfs.faireconomy.media/ff_calendar_thisweek.xml",
                 timeout=15, headers={"User-Agent": "Mozilla/5.0"}
             )
-            root = ET.fromstring(resp.content)
+            if resp.status_code != 200:
+                log.warning(f"FF XML status: {resp.status_code}")
+                return []
+            # BeautifulSoup — ET'den daha toleransli
+            soup = BeautifulSoup(resp.content, "html.parser")
             events = []
-            for ev in root.findall("event"):
-                title   = (ev.findtext("title") or "").strip()
-                country = (ev.findtext("country") or "").strip()  # USD, EUR, GBP vs.
-                date_s  = (ev.findtext("date") or "").strip()     # 03-12-2026
-                time_s  = (ev.findtext("time") or "").strip()     # 12:30pm
-                impact  = (ev.findtext("impact") or "").strip()   # High, Medium, Low
-                forecast= (ev.findtext("forecast") or "").strip()
-                previous= (ev.findtext("previous") or "").strip()
+            for ev in soup.find_all("event"):
+                title   = (ev.find("title").text.strip() if ev.find("title") else "")
+                country = (ev.find("country").text.strip() if ev.find("country") else "")
+                date_s  = (ev.find("date").text.strip() if ev.find("date") else "")
+                time_s  = (ev.find("time").text.strip() if ev.find("time") else "")
+                impact  = (ev.find("impact").text.strip() if ev.find("impact") else "")
+                forecast= (ev.find("forecast").text.strip() if ev.find("forecast") else "")
+                previous= (ev.find("previous").text.strip() if ev.find("previous") else "")
 
                 if not title or not date_s or not time_s:
                     continue
@@ -1909,28 +1915,28 @@ def ff_takvim_str(target_date_str):
        target_date_str: 'MM-DD-YYYY' formatinda (FF formatı)
     """
     try:
-        import xml.etree.ElementTree as ET
         resp = requests.get(
             "https://nfs.faireconomy.media/ff_calendar_thisweek.xml",
             timeout=15, headers={"User-Agent": "Mozilla/5.0"}
         )
-        root = ET.fromstring(resp.content)
+        soup = BeautifulSoup(resp.content, "html.parser")
         evs = []
-        for ev in root.findall("event"):
-            date_s   = (ev.findtext("date") or "").strip()
+        for ev in soup.find_all("event"):
+            date_s   = (ev.find("date").text.strip() if ev.find("date") else "")
             if date_s != target_date_str:
                 continue
-            country  = (ev.findtext("country") or "").strip()
-            impact   = (ev.findtext("impact") or "").strip()
-            title    = (ev.findtext("title") or "").strip()
-            time_s   = (ev.findtext("time") or "").strip()
-            forecast = (ev.findtext("forecast") or "").strip()
+            country  = (ev.find("country").text.strip() if ev.find("country") else "")
+            impact   = (ev.find("impact").text.strip() if ev.find("impact") else "")
+            title    = (ev.find("title").text.strip() if ev.find("title") else "")
+            time_s   = (ev.find("time").text.strip() if ev.find("time") else "")
+            forecast = (ev.find("forecast").text.strip() if ev.find("forecast") else "")
             if country != "USD" or impact not in ("High", "Medium"):
                 continue
             fc = f" (F:{forecast})" if forecast else ""
             evs.append(f"- {time_s} {title}{fc} [{impact}]")
         return "\n".join(evs[:8]) if evs else None
-    except Exception:
+    except Exception as e:
+        log.warning(f"ff_takvim_str: {e}")
         return None
 
 # ================================================================
@@ -2317,7 +2323,9 @@ def ai_skore_et(haberler, mod):
             if 0 <= idx < len(haberler):
                 mevcut   = haberler[idx].get("semboller", [])
                 raw_skor = max(0, min(10, int(s.get("skor", 0))))
-                if petrol_haberi_mi(haberler[idx].get("baslik","")):
+                # Petrol bonus: sadece AI zaten 5+ verdiyse (alakali haber)
+                # F1/spor/magazin gibi false positive'leri engelle
+                if petrol_haberi_mi(haberler[idx].get("baslik","")) and raw_skor >= 5:
                     raw_skor = min(10, raw_skor + 2)
                 adj_skor = tier_skor_ayarla(raw_skor, haberler[idx].get("tier", 2))
                 haberler[idx].update({
