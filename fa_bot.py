@@ -6,7 +6,7 @@
 
 import sys, importlib.util, os, re, math, asyncio, logging, datetime as dt, io, time
 from html import escape as html_escape
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 
 import numpy as np
 import pandas as pd
@@ -824,8 +824,8 @@ class CrossHunter:
         self.enabled = True
 
     def scan_all(self):
-        """UNIVERSE'u tara, YENi sinyalleri dondur"""
-        new_signals = defaultdict(list)
+        """UNIVERSE'u tara, YENi sinyalleri dondur — detayli bilgiyle"""
+        new_signals = []  # list of dicts now, not defaultdict
         all_signals = {}
         for t in UNIVERSE:
             try:
@@ -834,14 +834,25 @@ class CrossHunter:
                 if not tech:
                     continue
                 signals = set()
+                details = {
+                    "ticker": t,
+                    "price": tech.get("price"),
+                    "rsi": tech.get("rsi"),
+                    "ma50": tech.get("ma50"),
+                    "ma200": tech.get("ma200"),
+                    "tech_score": tech.get("tech_score", 50),
+                    "vol_ratio": tech.get("vol_ratio"),
+                    "pct_from_high": tech.get("pct_from_high"),
+                    "macd_bullish": tech.get("macd_bullish"),
+                }
                 if tech.get("cross_signal") == "GOLDEN_CROSS":
                     signals.add("Golden Cross")
                 if tech.get("cross_signal") == "DEATH_CROSS":
                     signals.add("Death Cross")
                 if tech.get("rsi") and tech["rsi"] > 70:
-                    signals.add(f"RSI Asiri Alim ({tech['rsi']:.0f})")
+                    signals.add("RSI Asiri Alim")
                 if tech.get("rsi") and tech["rsi"] < 30:
-                    signals.add(f"RSI Asiri Satim ({tech['rsi']:.0f})")
+                    signals.add("RSI Asiri Satim")
                 if tech.get("macd_cross") == "BULLISH":
                     signals.add("MACD Bullish Cross")
                 if tech.get("macd_cross") == "BEARISH":
@@ -857,7 +868,7 @@ class CrossHunter:
                 prev = self.prev_signals.get(t, set())
                 for sig in signals:
                     if sig not in prev:
-                        new_signals[sig].append(t)
+                        new_signals.append({"signal": sig, **details})
             except Exception as e:
                 log.debug(f"CrossHunter {t}: {e}")
 
@@ -866,7 +877,7 @@ class CrossHunter:
         return new_signals
 
     def format_report(self, new_signals):
-        """Telegram mesaji olustur"""
+        """Telegram mesaji olustur — detayli, aciklayici"""
         if not new_signals:
             return None
         now = dt.datetime.now(dt.timezone.utc)
@@ -876,28 +887,53 @@ class CrossHunter:
             "━━━━━━━━━━━━━━━━━━━━━━",
             "",
         ]
-        order = ["Golden Cross", "Death Cross",
-                 "MACD Bullish Cross", "MACD Bearish Cross",
-                 "BB Ust Band Kirilim", "BB Alt Band Kirilim"]
-        for sig_name in order:
-            if sig_name in new_signals:
-                icon = "🟢" if "Golden" in sig_name or "Bullish" in sig_name else "🔴" if "Death" in sig_name or "Bearish" in sig_name else "🟡"
-                tickers = ", ".join([f"<code>{t}</code>" for t in new_signals[sig_name]])
-                lines.append(f"{icon} <b>{sig_name}:</b> {tickers}")
-        # RSI sinyalleri
-        for sig_name, tickers in new_signals.items():
-            if "RSI" in sig_name:
-                icon = "🟢" if "Satim" in sig_name else "🔴"
-                tlist = ", ".join([f"<code>{t}</code>" for t in tickers])
-                lines.append(f"{icon} <b>{sig_name}:</b> {tlist}")
-        # BB sinyalleri (order'da olmayanlar)
-        for sig_name, tickers in new_signals.items():
-            if sig_name not in order and "RSI" not in sig_name:
-                tlist = ", ".join([f"<code>{t}</code>" for t in tickers])
-                lines.append(f"🟡 <b>{sig_name}:</b> {tlist}")
-        lines.append("")
-        total = sum(len(v) for v in new_signals.values())
-        lines.append(f"Toplam: {total} yeni sinyal | {len(UNIVERSE)} hisse tarandi")
+
+        # Sinyal aciklamalari
+        SIGNAL_INFO = {
+            "Golden Cross": ("🟢", "MA50 yukarı kesdi MA200'ü — orta/uzun vade yukari donusu"),
+            "Death Cross": ("🔴", "MA50 asagi kesdi MA200'ü — orta/uzun vade asagi donusu"),
+            "MACD Bullish Cross": ("🟢", "MACD sinyal cizgisini yukari kesti — momentum artıyor"),
+            "MACD Bearish Cross": ("🔴", "MACD sinyal cizgisini asagi kesti — momentum zayıflıyor"),
+            "RSI Asiri Alim": ("🔴", "RSI 70+ — asırı alım, düzeltme riski"),
+            "RSI Asiri Satim": ("🟢", "RSI 30- — asırı satım, dip fırsatı olabilir"),
+            "BB Ust Band Kirilim": ("🟡", "Fiyat Bollinger üst bandını kırdı — momentum güçlü ama aşırı olabilir"),
+            "BB Alt Band Kirilim": ("🟡", "Fiyat Bollinger alt bandını kırdı — oversold veya trend devam"),
+        }
+
+        # Gruplama: sinyal bazında
+        grouped = OrderedDict()
+        for s in new_signals:
+            sig = s["signal"]
+            if sig not in grouped:
+                grouped[sig] = []
+            grouped[sig].append(s)
+
+        for sig_name, items in grouped.items():
+            icon, explanation = SIGNAL_INFO.get(sig_name, ("🟡", ""))
+            lines.append(f"{icon} <b>{sig_name}</b>")
+            lines.append(f"<i>{explanation}</i>")
+            for item in items:
+                t = item["ticker"]
+                p = item.get("price")
+                rsi = item.get("rsi")
+                ts = item.get("tech_score", 50)
+                vol = item.get("vol_ratio")
+                pct_h = item.get("pct_from_high")
+
+                detail_parts = [f"<code>{t}</code>"]
+                if p: detail_parts.append(f"{p:.2f} TL")
+                if rsi: detail_parts.append(f"RSI:{rsi:.0f}")
+                detail_parts.append(f"Teknik:{ts:.0f}")
+                if vol and vol > 1.3: detail_parts.append(f"Hacim:{vol:.1f}x")
+                if pct_h: detail_parts.append(f"52W:{pct_h:.0f}%")
+
+                lines.append(f"  → {' | '.join(detail_parts)}")
+            lines.append("")
+
+        # Ozet
+        bullish = sum(1 for s in new_signals if s["signal"] in ("Golden Cross", "MACD Bullish Cross", "RSI Asiri Satim"))
+        bearish = sum(1 for s in new_signals if s["signal"] in ("Death Cross", "MACD Bearish Cross", "RSI Asiri Alim"))
+        lines.append(f"<b>Özet:</b> {len(new_signals)} sinyal | 🟢 {bullish} bullish | 🔴 {bearish} bearish | {len(UNIVERSE)} hisse tarandi")
         return "\n".join(lines)
 
 cross_hunter = CrossHunter()
@@ -1300,7 +1336,7 @@ async def cross_hunter_loop(app):
                         text=report,
                         parse_mode=ParseMode.HTML
                     )
-                    log.info(f"CrossHunter: {sum(len(v) for v in new_signals.values())} yeni sinyal gonderildi")
+                    log.info(f"CrossHunter: {len(new_signals)} yeni sinyal gonderildi")
                 else:
                     log.info("CrossHunter: yeni sinyal yok")
         except Exception as e:
