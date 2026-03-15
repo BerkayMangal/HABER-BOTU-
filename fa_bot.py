@@ -1111,20 +1111,30 @@ def top10_text_render():
     return "\n".join(lines)
 
 # ================================================================
-# SCAN
+# SCAN (V5.1 — ThreadPoolExecutor for parallel yfinance)
 # ================================================================
+def _analyze_safe(ticker):
+    """Thread-safe analyze wrapper"""
+    try:
+        return analyze_symbol(normalize_symbol(ticker))
+    except Exception as e:
+        log.debug(f"scan skip {ticker}: {e}")
+        return None
+
 def scan_universe_blocking():
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     ranked = []
-    for t in UNIVERSE:
-        try:
-            r = analyze_symbol(normalize_symbol(t))
-            if r["confidence"] >= CONFIDENCE_MIN:
+    # 6 parallel threads — yfinance tolerates this
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        futures = {pool.submit(_analyze_safe, t): t for t in UNIVERSE}
+        for future in as_completed(futures):
+            r = future.result()
+            if r and r["confidence"] >= CONFIDENCE_MIN:
                 ranked.append(r)
-        except Exception as e:
-            log.warning("scan skip %s: %s", t, e)
     ranked.sort(key=lambda x: (x["overall"], x["scores"]["quality"]), reverse=True)
     TOP10_CACHE["asof"] = dt.datetime.now(dt.timezone.utc)
     TOP10_CACHE["items"] = ranked[:10]
+    log.info(f"Top10 scan tamamlandi: {len(ranked)} hisse, en iyi: {ranked[0]['ticker'] if ranked else '—'}")
     return TOP10_CACHE["items"]
 
 # ================================================================
