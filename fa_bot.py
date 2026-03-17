@@ -569,16 +569,26 @@ def compute_technical(symbol):
         ma50_val = float(ma50.iloc[-1]) if not np.isnan(ma50.iloc[-1]) else None
         ma200_val = float(ma200.iloc[-1]) if len(c) >= 200 and not np.isnan(ma200.iloc[-1]) else None
 
-        # Golden/Death Cross detection
+        # Golden/Death Cross detection — son 5 gun icinde
         cross_signal = None
-        if ma50_val and ma200_val and len(ma50) >= 2 and len(ma200) >= 2:
-            prev_50 = float(ma50.iloc[-2]) if not np.isnan(ma50.iloc[-2]) else None
-            prev_200 = float(ma200.iloc[-2]) if not np.isnan(ma200.iloc[-2]) else None
-            if prev_50 and prev_200:
-                if prev_50 <= prev_200 and ma50_val > ma200_val:
-                    cross_signal = "GOLDEN_CROSS"
-                elif prev_50 >= prev_200 and ma50_val < ma200_val:
-                    cross_signal = "DEATH_CROSS"
+        ma_state = None  # MA50 vs MA200 pozisyonu
+        if ma50_val and ma200_val:
+            if ma50_val > ma200_val:
+                ma_state = "BULLISH"  # MA50 > MA200
+            else:
+                ma_state = "BEARISH"  # MA50 < MA200
+            # Son 5 barda cross var mi?
+            if len(ma50) >= 6 and len(ma200) >= 6:
+                for lookback in range(1, 6):
+                    p50 = float(ma50.iloc[-(lookback+1)]) if not np.isnan(ma50.iloc[-(lookback+1)]) else None
+                    p200 = float(ma200.iloc[-(lookback+1)]) if not np.isnan(ma200.iloc[-(lookback+1)]) else None
+                    c50 = float(ma50.iloc[-lookback]) if not np.isnan(ma50.iloc[-lookback]) else None
+                    c200 = float(ma200.iloc[-lookback]) if not np.isnan(ma200.iloc[-lookback]) else None
+                    if p50 and p200 and c50 and c200:
+                        if p50 <= p200 and c50 > c200 and cross_signal is None:
+                            cross_signal = "GOLDEN_CROSS"
+                        elif p50 >= p200 and c50 < c200 and cross_signal is None:
+                            cross_signal = "DEATH_CROSS"
 
         # RSI (14)
         delta = c.diff()
@@ -597,15 +607,19 @@ def compute_technical(symbol):
         signal_val = float(signal_line.iloc[-1])
         macd_hist = macd_val - signal_val
         macd_bullish = macd_val > signal_val
-        # MACD crossover (yeni mi?)
+        # MACD crossover — son 3 barda
         macd_cross = None
-        if len(macd_line) >= 2:
-            prev_macd = float(macd_line.iloc[-2])
-            prev_sig = float(signal_line.iloc[-2])
-            if prev_macd <= prev_sig and macd_val > signal_val:
-                macd_cross = "BULLISH"
-            elif prev_macd >= prev_sig and macd_val < signal_val:
-                macd_cross = "BEARISH"
+        if len(macd_line) >= 4:
+            for lb in range(1, 4):
+                pm = float(macd_line.iloc[-(lb+1)]) if not np.isnan(macd_line.iloc[-(lb+1)]) else None
+                ps = float(signal_line.iloc[-(lb+1)]) if not np.isnan(signal_line.iloc[-(lb+1)]) else None
+                cm = float(macd_line.iloc[-lb]) if not np.isnan(macd_line.iloc[-lb]) else None
+                cs = float(signal_line.iloc[-lb]) if not np.isnan(signal_line.iloc[-lb]) else None
+                if pm and ps and cm and cs:
+                    if pm <= ps and cm > cs and macd_cross is None:
+                        macd_cross = "BULLISH"
+                    elif pm >= ps and cm < cs and macd_cross is None:
+                        macd_cross = "BEARISH"
 
         # Bollinger Bands
         bb_mid = c.rolling(20).mean()
@@ -672,7 +686,7 @@ def compute_technical(symbol):
             "price": price, "ma50": ma50_val, "ma200": ma200_val,
             "rsi": rsi_val, "macd": macd_val, "macd_signal": signal_val,
             "macd_hist": macd_hist, "macd_bullish": macd_bullish,
-            "macd_cross": macd_cross, "cross_signal": cross_signal,
+            "macd_cross": macd_cross, "cross_signal": cross_signal, "ma_state": ma_state,
             "bb_pos": bb_pos,
             "high_52w": high_52w, "low_52w": low_52w,
             "pct_from_high": pct_from_high, "pct_from_low": pct_from_low,
@@ -861,6 +875,14 @@ class CrossHunter:
                     signals.add("BB Ust Band Kirilim")
                 if tech.get("bb_pos") == "BELOW":
                     signals.add("BB Alt Band Kirilim")
+                # V5.2: 52W proximity
+                if tech.get("pct_from_high") is not None and tech["pct_from_high"] >= -3:
+                    signals.add("52W Zirve Yakininda")
+                if tech.get("pct_from_low") is not None and tech["pct_from_low"] <= 5:
+                    signals.add("52W Dip Yakininda")
+                # V5.2: Yuksek hacim
+                if tech.get("vol_ratio") and tech["vol_ratio"] >= 2.5:
+                    signals.add("Yuksek Hacim")
 
                 all_signals[t] = signals
 
@@ -890,14 +912,17 @@ class CrossHunter:
 
         # Sinyal aciklamalari
         SIGNAL_INFO = {
-            "Golden Cross": ("🟢", "MA50 yukarı kesdi MA200'ü — orta/uzun vade yukari donusu"),
-            "Death Cross": ("🔴", "MA50 asagi kesdi MA200'ü — orta/uzun vade asagi donusu"),
-            "MACD Bullish Cross": ("🟢", "MACD sinyal cizgisini yukari kesti — momentum artıyor"),
-            "MACD Bearish Cross": ("🔴", "MACD sinyal cizgisini asagi kesti — momentum zayıflıyor"),
-            "RSI Asiri Alim": ("🔴", "RSI 70+ — asırı alım, düzeltme riski"),
-            "RSI Asiri Satim": ("🟢", "RSI 30- — asırı satım, dip fırsatı olabilir"),
-            "BB Ust Band Kirilim": ("🟡", "Fiyat Bollinger üst bandını kırdı — momentum güçlü ama aşırı olabilir"),
-            "BB Alt Band Kirilim": ("🟡", "Fiyat Bollinger alt bandını kırdı — oversold veya trend devam"),
+            "Golden Cross": ("🟢", "MA50 yukari kesti MA200'u — orta/uzun vade yukari donusu (son 5 gun)"),
+            "Death Cross": ("🔴", "MA50 asagi kesti MA200'u — orta/uzun vade asagi donusu (son 5 gun)"),
+            "MACD Bullish Cross": ("🟢", "MACD sinyal cizgisini yukari kesti — momentum artiyor"),
+            "MACD Bearish Cross": ("🔴", "MACD sinyal cizgisini asagi kesti — momentum zayifliyor"),
+            "RSI Asiri Alim": ("🔴", "RSI 70+ — asiri alim, duzeltme riski"),
+            "RSI Asiri Satim": ("🟢", "RSI 30- — asiri satim, dip firsati olabilir"),
+            "BB Ust Band Kirilim": ("🟡", "Fiyat Bollinger ust bandini kirdi — guclu ama asiri olabilir"),
+            "BB Alt Band Kirilim": ("🟡", "Fiyat Bollinger alt bandini kirdi — oversold veya trend devam"),
+            "52W Zirve Yakininda": ("🟢", "Fiyat 52 haftalik zirveye %3 mesafede — guclu momentum"),
+            "52W Dip Yakininda": ("🔴", "Fiyat 52 haftalik dibe %5 mesafede — deger firsati veya tuzak"),
+            "Yuksek Hacim": ("🟡", "Hacim 2.5x ortalamanin uzerinde — buyuk islem, dikkat"),
         }
 
         # Gruplama: sinyal bazında
